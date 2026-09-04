@@ -1,0 +1,14 @@
+{
+  "name": "whatsapp-lead-outreach",
+  "version": "1.0.0",
+  "description": "Send personalized WhatsApp messages to leads from an Excel file, using your own WhatsApp Web session (no API cost).",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "^1.23.0",
+    "qrcode-terminal": "^0.12.0",
+    "xlsx": "^0.18.5"
+  }
+}
