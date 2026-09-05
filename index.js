@@ -20,7 +20,7 @@
  */
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const qrcode = require('qrcode'); // writes QR to a PNG file — no terminal output
 const XLSX = require('xlsx');
 const fs = require('fs');
 const path = require('path');
@@ -277,18 +277,71 @@ async function main() {
     return;
   }
 
+  // Guard against unhandled promise rejections from inside whatsapp-web.js
+  // internals (e.g. LocalAuth.logout() hitting EBUSY on locked SQLite files
+  // while Chromium is still shutting down). We log the error and exit cleanly
+  // instead of letting Node crash with an ugly stack trace.
+  process.on('unhandledRejection', (reason) => {
+    console.error('\nUnhandled internal error (whatsapp-web.js internals):');
+    console.error(reason);
+    console.log('Exiting. Run the script again to reconnect.');
+    process.exit(1);
+  });
+
   const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: { headless: true, args: ['--no-sandbox'] },
+    // NOTE: Do NOT add webVersionCache with a remotePath here — fetching a
+    // pinned version from GitHub causes repeated re-authentication loops
+    // (you'll see "AUTHENTICATED" printed 5+ times) which leaves the session
+    // in a broken state where sendMessage appears to succeed but never delivers.
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-features=site-per-process',
+      ],
+    },
   });
 
+  // QR is written to a PNG file instead of printed to terminal.
+  // Open qr.png and scan it with WhatsApp > Linked Devices.
+  // The file is overwritten each time a fresh QR is generated.
   client.on('qr', (qr) => {
-    console.log('Scan this QR code with WhatsApp on your phone (Linked Devices):');
-    qrcode.generate(qr, { small: true });
+    qrcode.toFile('./qr.png', qr, { type: 'png', width: 400 }, (err) => {
+      if (err) {
+        console.error('Failed to write qr.png:', err);
+      } else {
+        console.log('QR code updated — open qr.png and scan with WhatsApp (Linked Devices).');
+      }
+    });
   });
+
+  // ── Lifecycle logging — helps pinpoint where connection stalls ──────────
+  client.on('loading_screen', (percent, message) => {
+    console.log(`Loading: ${percent}% - ${message}`);
+  });
+
+  client.on('authenticated', () => {
+    console.log('AUTHENTICATED — waiting for ready event...');
+  });
+
+  client.on('change_state', (state) => {
+    console.log('STATE CHANGE:', state);
+  });
+  // ────────────────────────────────────────────────────────────────────────
 
   client.on('ready', async () => {
-    console.log('WhatsApp client ready. Starting send loop...\n');
+    console.log('WhatsApp client ready.');
+
+    // Brief settle pause: the WhatsApp Web page sometimes continues loading
+    // (loading_screen events) even after the ready event fires. Waiting a few
+    // seconds lets it fully stabilise before we start sending.
+    console.log('Waiting 5s for page to fully settle...');
+    await sleep(5_000);
+    console.log('Starting send loop...\n');
 
     let sentThisRun = 0; // counts successful sends in this script invocation
 
@@ -316,22 +369,28 @@ async function main() {
           continue;
         }
 
-        // ── Typing indicator ────────────────────────────────────────────
-        // Simulate a human composing the message before sending it.
-        // Wrapped in its own try/catch: a failure here is non-fatal and
-        // must never prevent the actual message from being delivered.
-        try {
-          const chat = await client.getChatById(numberDetails._serialized);
-          await chat.sendStateTyping();
-          const typingDelay = randomBetween(MIN_TYPING_MS, MAX_TYPING_MS);
-          await sleep(typingDelay);
-        } catch (typingErr) {
-          console.warn(`  ⚠ Could not set typing state for ${phone}: ${typingErr.message} — continuing send.`);
+        // Always use the @c.us format for sendMessage and getChatById.
+        // getNumberId() may return a @lid (Linked Identity) address in newer
+        // WhatsApp versions — sending to @lid silently fails without an error.
+        const chatId = `${phone}@c.us`;
+        if (numberDetails._serialized !== chatId) {
+          console.log(`  (resolved to ${numberDetails._serialized}, sending via ${chatId})`);
         }
+
+        // ── Typing-like pause ────────────────────────────────────────────
+        // Simulates a human composing the message by waiting a short random
+        // interval before sending. We do NOT call getChatById/sendStateTyping
+        // because that API fails for new contacts (no existing chat object)
+        // and isn't worth the complexity for cold-outreach use.
+        const typingDelay = randomBetween(MIN_TYPING_MS, MAX_TYPING_MS);
+        console.log(`  (pausing ${typingDelay / 1000}s before send...)`);
+        await sleep(typingDelay);
         // ────────────────────────────────────────────────────────────────
 
-        await client.sendMessage(numberDetails._serialized, message);
+        console.log(`  → Sending to ${lead[COLS.name]} at ${chatId}...`);
+        await client.sendMessage(chatId, message);
         console.log(`✓ Sent to ${lead[COLS.name]} (${phone}) [${category || 'default'}]`);
+        console.log(`  (Check your WhatsApp phone — you should now see a sent message to this contact.)`);
 
         // Update both the per-number sent log and the daily counter.
         log[phone] = { status: 'sent', category, at: new Date().toISOString() };
@@ -377,6 +436,19 @@ async function main() {
       `\nAll done for today. Sent ${sentThisRun} message(s) this run ` +
       `(${dailyCount.count}/${DAILY_CAP} total today). See sent-log.json for the full record.`
     );
+
+    // IMPORTANT: sendMessage queues the message in WhatsApp Web's JS runtime,
+    // but the actual WebSocket transmission to WhatsApp's servers is async.
+    // We must wait here long enough for the browser to flush the outbound
+    // message before we destroy the Puppeteer session. Without this wait,
+    // messages appear to send (no error thrown) but never arrive.
+    if (sentThisRun > 0) {
+      console.log('Waiting 15s for message(s) to flush to WhatsApp servers...');
+      await sleep(15_000);
+      console.log('Done. Shutting down.');
+    }
+
+    await client.destroy();
     process.exit(0);
   });
 
@@ -385,10 +457,24 @@ async function main() {
   });
 
   client.on('disconnected', (reason) => {
-    console.error('Client disconnected:', reason);
+    console.error(`\nClient disconnected: ${reason}`);
+    if (reason === 'LOGOUT') {
+      console.error(
+        'WhatsApp forced a logout — this usually means the session data was stale or mismatched.\n' +
+        'Fix: delete the .wwebjs_auth folder and run again to get a fresh QR code.'
+      );
+    }
+    process.exit(1);
   });
 
-  client.initialize();
+  // Wrap initialize() so a synchronous throw is caught and logged in full.
+  try {
+    client.initialize();
+  } catch (err) {
+    console.error('client.initialize() threw an error:');
+    console.error(err); // log full error object, not just err.message
+    process.exit(1);
+  }
 }
 
 main();
