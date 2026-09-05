@@ -1,3 +1,21 @@
+# ---------------------------------------------------------------
+# WhatsApp Lead Outreach — runtime & generated files
+# None of these should ever be committed:
+#   sent-log.json    — who has been messaged (contains phone numbers)
+#   daily-count.json — daily send counter state
+#   qr.png           — QR image, regenerated every auth session
+#   .wwebjs_auth/    — Puppeteer/WhatsApp session tokens
+#   .wwebjs_cache/   — WhatsApp Web JS bundle cache
+#   leads.xlsx       — real lead data with personal info
+# ---------------------------------------------------------------
+sent-log.json
+daily-count.json
+qr.png
+.wwebjs_auth/
+.wwebjs_cache/
+leads.xlsx
+templates.json
+
 # Logs
 logs
 *.log
@@ -42,7 +60,7 @@ node_modules/
 jspm_packages/
 
 # Snowpack dependency directory (https://snowpack.dev/)
-web_modules/
+
 
 # TypeScript cache
 *.tsbuildinfo

@@ -7,40 +7,141 @@
  *
  * No WhatsApp Business API, no per-message cost. Just your phone's WhatsApp
  * account logged in once via QR code.
+ *
+ * Features:
+ *  - Daily send cap (hard stop at DAILY_CAP messages per calendar day)
+ *  - Batch pacing: longer pause after every BATCH_SIZE sends within a run
+ *  - Startup status line showing today's usage and pending lead count
+ *  - sent-log.json keyed by phone number is the sole source of truth for
+ *    who has already been messaged — works with growing or rotating Excel files
+ *  - Per-category message variant arrays: one variant is picked at random per
+ *    lead so no two recipients in the same category get identical wording
+ *  - Simulated typing indicator before each send for a more human-looking UX
  */
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const qrcode = require('qrcode'); // writes QR to a PNG file — no terminal output
 const XLSX = require('xlsx');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 
-// ---------- CONFIG ----------
+// ============================================================
+// CONFIG — adjust these values to tune behaviour
+// ============================================================
+
 const EXCEL_PATH = process.env.LEADS_FILE || './leads.xlsx';
 const TEMPLATES_PATH = './templates.json';
 const LOG_PATH = './sent-log.json';
 
-// Delay range (ms) between messages — randomized to look human and reduce ban risk.
-const MIN_DELAY_MS = 25000; // 25s
-const MAX_DELAY_MS = 55000; // 55s
+// Tracks messages sent today; resets automatically when the date changes.
+const DAILY_COUNT_PATH = './daily-count.json';
 
-// Column names expected in your Excel file (edit if yours differ)
+// Hard cap: the script will not send more than this many messages in a
+// single calendar day (across all runs on that day).
+const DAILY_CAP = 50;
+
+// After sending this many messages in one run, pause for a longer interval
+// before continuing. Counter resets each time the script is launched.
+const BATCH_SIZE = 15; // messages per batch before a long pause
+
+// Per-message delay (ms) — randomized to look human and reduce ban risk.
+const MIN_DELAY_MS = 25_000; // 25 s
+const MAX_DELAY_MS = 55_000; // 55 s
+
+// Longer pause taken between batches (ms).
+const MIN_BATCH_PAUSE_MS = 45 * 60 * 1_000; // 45 minutes
+const MAX_BATCH_PAUSE_MS = 90 * 60 * 1_000; // 90 minutes
+
+// How long to hold the "typing..." indicator before sending (ms).
+// Simulates a human composing the message; keeps it short to avoid timeout.
+const MIN_TYPING_MS = 2_000; //  2 s
+const MAX_TYPING_MS = 5_000; //  5 s
+
+// Column names expected in your Excel file (edit if yours differ).
 const COLS = {
   name: 'Name',
   phone: 'Phone',       // include country code, e.g. 919876543210 (no + or spaces)
-  category: 'Category',  // must match a key in templates.json
-  business: 'Business',  // optional, used in {{business}} placeholder
+  category: 'Category', // must match a key in templates.json
+  business: 'Business', // optional, used in {{business}} placeholder
 };
-// -----------------------------
+
+// ============================================================
+// END OF CONFIG
+// ============================================================
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function randomDelay() {
-  return Math.floor(Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS + 1)) + MIN_DELAY_MS;
+function randomBetween(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
+
+function randomDelay() {
+  return randomBetween(MIN_DELAY_MS, MAX_DELAY_MS);
+}
+
+function randomBatchPause() {
+  return randomBetween(MIN_BATCH_PAUSE_MS, MAX_BATCH_PAUSE_MS);
+}
+
+/** Returns today's date as a YYYY-MM-DD string using local time. */
+function todayString() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+// ---------- Daily-count helpers ----------
+
+/**
+ * Loads daily-count.json.
+ * Automatically resets to 0 if the stored date differs from today,
+ * so the cap always reflects the current calendar day.
+ * Returns { date: "YYYY-MM-DD", count: N }.
+ */
+function loadDailyCount() {
+  const today = todayString();
+  if (fs.existsSync(DAILY_COUNT_PATH)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(DAILY_COUNT_PATH, 'utf-8'));
+      if (data.date === today) return data; // same day — use stored count
+    } catch (_) {
+      // Corrupt file — fall through and reset.
+    }
+  }
+  // First run of the day, or file missing/corrupt: start fresh.
+  return { date: today, count: 0 };
+}
+
+/** Persists the updated daily count to disk after each successful send. */
+function saveDailyCount(dailyCount) {
+  fs.writeFileSync(DAILY_COUNT_PATH, JSON.stringify(dailyCount, null, 2));
+}
+
+// ---------- Template variant helper ----------
+
+/**
+ * Given a template entry (either a plain string for backwards-compatibility,
+ * or an array of variant strings), returns one variant chosen uniformly at
+ * random.  Arrays of length 1 work fine — the single item is always returned.
+ *
+ * To add more variants later, simply push additional strings into the
+ * array for that category key in templates.json.
+ */
+function pickVariant(entry) {
+  if (!entry) return null;
+  // Support both the new array format and any legacy bare-string values.
+  if (Array.isArray(entry)) {
+    return entry[Math.floor(Math.random() * entry.length)];
+  }
+  return entry; // bare string — use as-is
+}
+
+// ---------- Existing helpers (unchanged) ----------
 
 function loadTemplates() {
   if (!fs.existsSync(TEMPLATES_PATH)) {
@@ -80,8 +181,7 @@ function fillTemplate(template, lead) {
 
 function normalizePhone(raw) {
   // Strip spaces, dashes, plus signs. Expects country code included (e.g. 91XXXXXXXXXX).
-  let digits = String(raw).replace(/[^0-9]/g, '');
-  return digits;
+  return String(raw).replace(/[^0-9]/g, '');
 }
 
 function askConfirmation(question) {
@@ -94,62 +194,171 @@ function askConfirmation(question) {
   });
 }
 
+/** Formats a duration in ms into a human-readable "Xh Ym" or "Ym Xs" string. */
+function formatDuration(ms) {
+  const totalSec = Math.round(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+// ---------- Main ----------
+
 async function main() {
   const templates = loadTemplates();
   const leads = loadLeads();
   const log = loadLog();
+  const dailyCount = loadDailyCount();
 
+  // sent-log.json keyed by phone number is the sole source of truth for who
+  // has already been messaged.  This works correctly whether the leads file
+  // has grown (new rows appended) or been swapped out entirely.
   const pending = leads.filter((lead) => {
     const phone = normalizePhone(lead[COLS.phone]);
     return phone && !log[phone];
   });
 
-  console.log(`Loaded ${leads.length} leads. ${pending.length} not yet messaged.`);
+  const remainingCap = DAILY_CAP - dailyCount.count;
+
+  // ── Startup status line ──────────────────────────────────────────────────
+  console.log(`\nSent today: ${dailyCount.count}/${DAILY_CAP}.  ${pending.length} lead(s) remaining unmessaged.\n`);
+  // ────────────────────────────────────────────────────────────────────────
+
   if (pending.length === 0) {
-    console.log('Nothing to send. Exiting.');
+    console.log('Nothing to send — all leads in the file have already been messaged. Exiting.');
     return;
   }
 
-  // Show a preview of the first message so you can sanity-check before it starts blasting.
-  const preview = pending[0];
+  if (remainingCap <= 0) {
+    console.log(
+      `Daily cap of ${DAILY_CAP} messages already reached for today (${dailyCount.date}). ` +
+      `Run again tomorrow — the remaining ${pending.length} lead(s) will carry over automatically.`
+    );
+    return;
+  }
+
+  // Trim the list so we never exceed today's cap, even if there are more leads.
+  const toSend = pending.slice(0, remainingCap);
+
+  if (toSend.length < pending.length) {
+    console.log(
+      `Daily cap will be reached after ${toSend.length} message(s) today. ` +
+      `The remaining ${pending.length - toSend.length} lead(s) will carry over to the next run.\n`
+    );
+  }
+
+  // Show a preview of the first message (with the randomly-chosen variant)
+  // so you can sanity-check before the loop starts.
+  const preview = toSend[0];
   const previewCategory = (preview[COLS.category] || '').trim();
-  const previewTemplate = templates[previewCategory] || templates.default;
-  console.log('\n--- Preview of first message ---');
+  const previewEntry    = templates[previewCategory] || templates.default;
+  const previewVariant  = pickVariant(previewEntry);
+  const previewVariantIdx = Array.isArray(previewEntry)
+    ? previewEntry.indexOf(previewVariant) + 1  // 1-based for display
+    : null;
+  console.log('--- Preview of first message ---');
   console.log(`To: ${preview[COLS.name]} (${normalizePhone(preview[COLS.phone])})`);
-  console.log(fillTemplate(previewTemplate, preview));
+  if (previewVariantIdx !== null) {
+    console.log(`Variant ${previewVariantIdx}/${previewEntry.length} chosen for category "${previewCategory || 'default'}":`);
+  }
+  console.log(fillTemplate(previewVariant, preview));
   console.log('---------------------------------\n');
 
-  const confirm = await askConfirmation(`About to message ${pending.length} leads with ${MIN_DELAY_MS / 1000}-${MAX_DELAY_MS / 1000}s delays. Type "yes" to proceed: `);
+  const confirm = await askConfirmation(
+    `About to send up to ${toSend.length} message(s) today ` +
+    `(${MIN_DELAY_MS / 1000}–${MAX_DELAY_MS / 1000}s delays, ` +
+    `batch pause every ${BATCH_SIZE}). Type "yes" to proceed: `
+  );
   if (confirm !== 'yes') {
     console.log('Cancelled.');
     return;
   }
 
+  // Guard against unhandled promise rejections from inside whatsapp-web.js
+  // internals (e.g. LocalAuth.logout() hitting EBUSY on locked SQLite files
+  // while Chromium is still shutting down). We log the error and exit cleanly
+  // instead of letting Node crash with an ugly stack trace.
+  process.on('unhandledRejection', (reason) => {
+    console.error('\nUnhandled internal error (whatsapp-web.js internals):');
+    console.error(reason);
+    console.log('Exiting. Run the script again to reconnect.');
+    process.exit(1);
+  });
+
   const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: { headless: true, args: ['--no-sandbox'] },
+    // NOTE: Do NOT add webVersionCache with a remotePath here — fetching a
+    // pinned version from GitHub causes repeated re-authentication loops
+    // (you'll see "AUTHENTICATED" printed 5+ times) which leaves the session
+    // in a broken state where sendMessage appears to succeed but never delivers.
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-features=site-per-process',
+      ],
+    },
   });
 
+  // QR is written to a PNG file instead of printed to terminal.
+  // Open qr.png and scan it with WhatsApp > Linked Devices.
+  // The file is overwritten each time a fresh QR is generated.
   client.on('qr', (qr) => {
-    console.log('Scan this QR code with WhatsApp on your phone (Linked Devices):');
-    qrcode.generate(qr, { small: true });
+    qrcode.toFile('./qr.png', qr, { type: 'png', width: 400 }, (err) => {
+      if (err) {
+        console.error('Failed to write qr.png:', err);
+      } else {
+        console.log('QR code updated — open qr.png and scan with WhatsApp (Linked Devices).');
+      }
+    });
   });
+
+  // ── Lifecycle logging — helps pinpoint where connection stalls ──────────
+  client.on('loading_screen', (percent, message) => {
+    console.log(`Loading: ${percent}% - ${message}`);
+  });
+
+  client.on('authenticated', () => {
+    console.log('AUTHENTICATED — waiting for ready event...');
+  });
+
+  client.on('change_state', (state) => {
+    console.log('STATE CHANGE:', state);
+  });
+  // ────────────────────────────────────────────────────────────────────────
 
   client.on('ready', async () => {
-    console.log('WhatsApp client ready. Starting send loop...\n');
+    console.log('WhatsApp client ready.');
 
-    for (const lead of pending) {
-      const phone = normalizePhone(lead[COLS.phone]);
+    // Brief settle pause: the WhatsApp Web page sometimes continues loading
+    // (loading_screen events) even after the ready event fires. Waiting a few
+    // seconds lets it fully stabilise before we start sending.
+    console.log('Waiting 5s for page to fully settle...');
+    await sleep(5_000);
+    console.log('Starting send loop...\n');
+
+    let sentThisRun = 0; // counts successful sends in this script invocation
+
+    for (const lead of toSend) {
+      const phone    = normalizePhone(lead[COLS.phone]);
       const category = (lead[COLS.category] || '').trim();
-      const template = templates[category] || templates.default;
 
-      if (!template) {
+      // Pick a random variant from the category's array (or fall back to default).
+      const templateEntry = templates[category] || templates.default;
+      const variant       = pickVariant(templateEntry);
+
+      if (!variant) {
         console.warn(`No template for category "${category}" and no default set. Skipping ${lead[COLS.name]}.`);
         continue;
       }
 
-      const message = fillTemplate(template, lead);
-      const chatId = `${phone}@c.us`;
+      const message = fillTemplate(variant, lead);
 
       try {
         const numberDetails = await client.getNumberId(phone);
@@ -160,22 +369,86 @@ async function main() {
           continue;
         }
 
-        await client.sendMessage(numberDetails._serialized, message);
+        // Always use the @c.us format for sendMessage and getChatById.
+        // getNumberId() may return a @lid (Linked Identity) address in newer
+        // WhatsApp versions — sending to @lid silently fails without an error.
+        const chatId = `${phone}@c.us`;
+        if (numberDetails._serialized !== chatId) {
+          console.log(`  (resolved to ${numberDetails._serialized}, sending via ${chatId})`);
+        }
+
+        // ── Typing-like pause ────────────────────────────────────────────
+        // Simulates a human composing the message by waiting a short random
+        // interval before sending. We do NOT call getChatById/sendStateTyping
+        // because that API fails for new contacts (no existing chat object)
+        // and isn't worth the complexity for cold-outreach use.
+        const typingDelay = randomBetween(MIN_TYPING_MS, MAX_TYPING_MS);
+        console.log(`  (pausing ${typingDelay / 1000}s before send...)`);
+        await sleep(typingDelay);
+        // ────────────────────────────────────────────────────────────────
+
+        console.log(`  → Sending to ${lead[COLS.name]} at ${chatId}...`);
+        await client.sendMessage(chatId, message);
         console.log(`✓ Sent to ${lead[COLS.name]} (${phone}) [${category || 'default'}]`);
+        console.log(`  (Check your WhatsApp phone — you should now see a sent message to this contact.)`);
+
+        // Update both the per-number sent log and the daily counter.
         log[phone] = { status: 'sent', category, at: new Date().toISOString() };
         saveLog(log);
+
+        dailyCount.count += 1;
+        saveDailyCount(dailyCount);
+
+        sentThisRun += 1;
+
       } catch (err) {
         console.error(`✗ Failed for ${lead[COLS.name]} (${phone}): ${err.message}`);
         log[phone] = { status: 'error', error: err.message, at: new Date().toISOString() };
         saveLog(log);
       }
 
-      const delay = randomDelay();
-      console.log(`  waiting ${Math.round(delay / 1000)}s before next message...\n`);
-      await sleep(delay);
+      // ── Batch pause or per-message delay ──────────────────────────────
+      const isLastMessage = lead === toSend[toSend.length - 1];
+      const dailyCapHit  = dailyCount.count >= DAILY_CAP;
+
+      if (!isLastMessage && !dailyCapHit) {
+        if (sentThisRun > 0 && sentThisRun % BATCH_SIZE === 0) {
+          // End of a batch — take the long pause before continuing.
+          const pause = randomBatchPause();
+          console.log(
+            `\n⏸  Batch of ${BATCH_SIZE} complete ` +
+            `(${dailyCount.count}/${DAILY_CAP} sent today). ` +
+            `Pausing for ${formatDuration(pause)} before next batch...\n`
+          );
+          await sleep(pause);
+          console.log('Resuming send loop.\n');
+        } else {
+          // Normal inter-message delay.
+          const delay = randomDelay();
+          console.log(`  waiting ${Math.round(delay / 1000)}s before next message...\n`);
+          await sleep(delay);
+        }
+      }
+      // ──────────────────────────────────────────────────────────────────
     }
 
-    console.log('All done. See sent-log.json for the full record.');
+    console.log(
+      `\nAll done for today. Sent ${sentThisRun} message(s) this run ` +
+      `(${dailyCount.count}/${DAILY_CAP} total today). See sent-log.json for the full record.`
+    );
+
+    // IMPORTANT: sendMessage queues the message in WhatsApp Web's JS runtime,
+    // but the actual WebSocket transmission to WhatsApp's servers is async.
+    // We must wait here long enough for the browser to flush the outbound
+    // message before we destroy the Puppeteer session. Without this wait,
+    // messages appear to send (no error thrown) but never arrive.
+    if (sentThisRun > 0) {
+      console.log('Waiting 15s for message(s) to flush to WhatsApp servers...');
+      await sleep(15_000);
+      console.log('Done. Shutting down.');
+    }
+
+    await client.destroy();
     process.exit(0);
   });
 
@@ -184,10 +457,24 @@ async function main() {
   });
 
   client.on('disconnected', (reason) => {
-    console.error('Client disconnected:', reason);
+    console.error(`\nClient disconnected: ${reason}`);
+    if (reason === 'LOGOUT') {
+      console.error(
+        'WhatsApp forced a logout — this usually means the session data was stale or mismatched.\n' +
+        'Fix: delete the .wwebjs_auth folder and run again to get a fresh QR code.'
+      );
+    }
+    process.exit(1);
   });
 
-  client.initialize();
+  // Wrap initialize() so a synchronous throw is caught and logged in full.
+  try {
+    client.initialize();
+  } catch (err) {
+    console.error('client.initialize() threw an error:');
+    console.error(err); // log full error object, not just err.message
+    process.exit(1);
+  }
 }
 
 main();
