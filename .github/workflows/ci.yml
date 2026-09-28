@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first run's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # --ignore-scripts skips the legacy terminal script's Chromium download,
+      # which CI has no use for and which dominates install time.
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck
+        run: npm run typecheck --workspaces --if-present
+
+      # No secrets: every route in the app renders on demand, so the build
+      # never reads DATABASE_URL or AUTH_SECRET. If this step ever starts
+      # needing them, something has been moved to module scope by mistake.
+      - name: Build web
+        run: npm run build --workspace=@wa/web
+
+      # Catches a schema change committed without its migration — the most
+      # likely way for production and the code to drift apart.
+      - name: Check migrations are up to date
+        run: |
+          npm run db:generate
+          if ! git diff --quiet --exit-code packages/db/drizzle; then
+            echo "::error::Schema changed without a migration. Run 'npm run db:generate' and commit the result."
+            git diff --stat packages/db/drizzle
+            exit 1
+          fi
