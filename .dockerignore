@@ -1,0 +1,34 @@
+# Keep the build context small, and keep secrets and personal data out of the
+# image entirely. Anything listed here is invisible to `docker build`.
+
+node_modules
+**/node_modules
+
+# Build output — rebuilt inside the image, and a host-built .next would shadow it.
+.next
+**/.next
+dist
+**/dist
+
+# Secrets. .env.example is intentionally NOT ignored.
+.env
+.env.*
+!.env.example
+
+# Legacy terminal script's local state: WhatsApp session tokens, a real
+# spreadsheet of leads, and the send log. None of it belongs in an image.
+.wwebjs_auth
+.wwebjs_cache
+leads.xlsx
+*.xlsx
+sent-log.json
+daily-count.json
+qr.png
+templates.json
+
+.git
+.github
+.vscode
+.idea
+**/*.log
+README.md

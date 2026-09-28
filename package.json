@@ -1,17 +1,41 @@
 {
-  "name": "whatsapp-lead-outreach",
-  "version": "1.0.0",
-  "description": "Send personalized WhatsApp messages to leads from an Excel file, using your own WhatsApp Web session (no API cost).",
-  "main": "index.js",
+  "name": "whatsapp-lead-platform",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Cloud platform for personalized WhatsApp lead outreach — upload a sheet, link WhatsApp by pairing code, send with safety pacing.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "start": "node index.js"
+    "start:legacy": "node index.js",
+    "start": "node index.js",
+    "dev": "npm run dev --workspace=@wa/web",
+    "dev:worker": "npm run dev --workspace=@wa/worker",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "db:generate": "npm run generate --workspace=@wa/db",
+    "db:migrate": "npm run migrate --workspace=@wa/db",
+    "db:push": "npm run push --workspace=@wa/db",
+    "db:studio": "npm run studio --workspace=@wa/db"
   },
   "dependencies": {
     "qrcode": "^1.5.4",
     "whatsapp-web.js": "^1.34.7",
     "xlsx": "^0.18.5"
   },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
   "allowScripts": {
-    "puppeteer@24.38.0": true
+    "puppeteer@24.38.0": true,
+    "esbuild@0.28.2": true,
+    "esbuild@0.19.12": true,
+    "esbuild@0.18.20": true
   }
 }
