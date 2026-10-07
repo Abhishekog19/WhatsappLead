@@ -98,6 +98,7 @@ async function main(): Promise<void> {
       ownerStatus.problems,
     );
 
+
     // -----------------------------------------------------------------------
     section('Tenant isolation (the product promise)');
 
@@ -227,6 +228,59 @@ async function main(): Promise<void> {
       systemLeak && afterSystem.length === 0,
       afterSystem.length,
     );
+
+    // Why the guard checks pg_roles.rolbypassrls for current_user only, and
+    // deliberately does NOT widen that to roles reachable through membership.
+    //
+    // Managed providers hand the login role membership of a privileged role
+    // (Neon's neon_superuser, for instance), and it is tempting to assume that
+    // inherits BYPASSRLS and to flag it. It does not: BYPASSRLS applies to the
+    // role itself and through SET ROLE, not through inheritance. A pg_has_role
+    // check would therefore refuse to boot on a perfectly safe setup.
+    //
+    // This asserts the Postgres behaviour the guard depends on, so a future
+    // "improvement" to that check fails here instead of in production.
+    await owner.db.execute(sql`create role verify_privileged nologin bypassrls`);
+    await owner.db.execute(
+      sql`create role verify_member login password 'x' nosuperuser nobypassrls`,
+    );
+    await owner.db.execute(sql`grant verify_privileged to verify_member`);
+    await owner.db.execute(sql`grant usage on schema public to verify_member`);
+    await owner.db.execute(
+      sql`grant select, insert, update, delete on all tables in schema public to verify_member`,
+    );
+
+    const inherited = await owner.db.execute<{
+      own: boolean;
+      reachable: boolean;
+    }>(sql`
+      select (select rolbypassrls from pg_roles where rolname = 'verify_member') as own,
+             exists (select 1 from pg_roles r
+                      where r.rolbypassrls
+                        and pg_has_role('verify_member', r.oid, 'USAGE'))        as reachable
+    `);
+    check(
+      'BYPASSRLS is reachable by membership but not held as an attribute',
+      inherited[0]?.own === false && inherited[0]?.reachable === true,
+      inherited[0],
+    );
+
+    const memberDb = createDb({
+      url: pg.appUrl.replace(`${'wa_app'}:verify-only`, 'verify_member:x'),
+      maxConnections: 1,
+    });
+    try {
+      const seen = await withUser(memberDb.db, alice, (tx) =>
+        tx.select().from(schema.contacts),
+      );
+      check(
+        'and inheriting it does not actually bypass RLS',
+        seen.length === 1,
+        seen.map((c) => c.name),
+      );
+    } finally {
+      await memberDb.sql.end({ timeout: 5 }).catch(() => undefined);
+    }
 
     // -----------------------------------------------------------------------
     section('Append-only audit log');
