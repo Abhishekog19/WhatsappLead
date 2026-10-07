@@ -22,7 +22,8 @@ jobs:
           cache: npm
 
       # --ignore-scripts skips the legacy terminal script's Chromium download,
-      # which CI has no use for and which dominates install time.
+      # which CI has no use for and which dominates install time. The embedded
+      # Postgres used below ships prebuilt binaries and needs no build step.
       - name: Install
         run: npm ci --ignore-scripts
 
@@ -45,3 +46,28 @@ jobs:
             git diff --stat packages/db/drizzle
             exit 1
           fi
+
+      # Boots a real Postgres and asserts what TypeScript cannot: that the
+      # row-level security policies actually isolate tenants, that the claim
+      # query is safe under concurrency, and that the search and upsert SQL do
+      # what the UI assumes.
+      #
+      # This is not optional belt-and-braces. The first version of
+      # docker-compose.yml connected the app as a superuser, which makes every
+      # RLS policy silently inert — the application behaved perfectly and
+      # isolation was simply gone. Only a check like this one finds that.
+      #
+      # The hydrate step is run explicitly rather than by dropping
+      # --ignore-scripts above: it is the one postinstall this job needs, and
+      # naming it keeps every other package's scripts blocked.
+      - name: Prepare embedded Postgres
+        run: node node_modules/@embedded-postgres/linux-x64/scripts/hydrate-symlinks.js
+
+      - name: Verify schema and isolation
+        run: npm run verify --workspace=@wa/db
+
+      # Runs the real send job against a real database with a stubbed WhatsApp
+      # socket: dedupe, suppression, the rolling cap, template rendering, and
+      # the ledgers that back them.
+      - name: Verify send pipeline
+        run: npm run verify:pipeline --workspace=@wa/worker
