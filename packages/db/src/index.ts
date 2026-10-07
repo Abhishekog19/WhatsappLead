@@ -1,5 +1,6 @@
 export * from './client';
 export * from './tenant';
+export * from './isolation';
 export * as schema from './schema/index';
 export * from './schema/index';
 export {
