@@ -1,9 +1,11 @@
-import { sql } from '@wa/db';
+import { assertTenantIsolation, sql } from '@wa/db';
 import { createContext } from './context';
 import { startHealthServer } from './health';
 import { Scheduler } from './scheduler';
 import { expirePairingArtifacts } from './jobs/expire-pairing-artifacts';
+import { maintainSessions } from './jobs/maintain-sessions';
 import { reapStaleClaims } from './jobs/reap-stale-claims';
+import { sendCampaigns } from './jobs/send-campaigns';
 import { settleCampaigns } from './jobs/settle-campaigns';
 
 /**
@@ -14,13 +16,14 @@ import { settleCampaigns } from './jobs/settle-campaigns';
  * 24-hour caps, and the housekeeping below. The web app never sends a message
  * itself — a request lasts seconds, a campaign lasts hours.
  *
- * As of phase 0 the jobs are the housekeeping ones. The send loop and the
- * WhatsApp connection manager attach to the same scheduler in phase 3.
+ * This is also the only process allowed to hold a WhatsApp socket. WhatsApp
+ * permits one connection per linked device, so a second one opened by the web
+ * tier would fight this one until the number got logged out.
  *
  * Shutdown matters more than usual here. A `docker compose up -d --build`
  * sends SIGTERM, and a worker killed mid-send leaves a target row claimed. The
- * handler below stops scheduling, lets the job in flight finish, and only then
- * drains the connection pool.
+ * handler below stops scheduling, lets the job in flight finish, closes every
+ * socket so the credential writes land, and only then drains the pool.
  */
 
 /** Longest we wait for in-flight work before exiting anyway. */
@@ -40,7 +43,18 @@ async function main(): Promise<void> {
   await ctx.db.execute(sql`select 1`);
   ctx.log.info('database reachable');
 
+  // Refuse to run if tenant isolation is not actually enforced. A superuser
+  // connection makes every row-level security policy a no-op without any
+  // visible symptom, so this is checked rather than assumed — the whole
+  // product rests on one account's data never touching another's.
+  const isolation = await assertTenantIsolation(ctx.db);
+  ctx.log.info('tenant isolation enforced', { role: isolation.role });
+
   const scheduler = new Scheduler(ctx, [
+    // Order is deliberate: sockets are brought up before the sender looks for
+    // work, so a freshly resumed session is usable on the same tick.
+    maintainSessions,
+    sendCampaigns,
     reapStaleClaims,
     settleCampaigns,
     expirePairingArtifacts,
@@ -62,6 +76,9 @@ async function main(): Promise<void> {
     // while the current job finishes.
     health.close();
     await scheduler.stop(SHUTDOWN_GRACE_MS);
+    // Before the pool closes: each socket flushes its encrypted auth state,
+    // and that write needs a connection.
+    await ctx.wa.closeAll();
     await ctx.sql.end({ timeout: 5 });
 
     ctx.log.info('shutdown complete');
