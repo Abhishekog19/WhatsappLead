@@ -1,4 +1,16 @@
 import type { NextConfig } from 'next';
+import { loadEnvFile } from '@wa/core';
+
+/**
+ * Next only reads `.env` from this app's own directory, but the repository
+ * keeps one at the root so Compose can use the same file for interpolation.
+ * Loading it here puts it in place for `next dev` and `next start`.
+ *
+ * Not a substitute for real configuration: the standalone production server
+ * does not execute this file, and in the container Compose supplies the
+ * environment anyway.
+ */
+loadEnvFile();
 
 const config: NextConfig = {
   reactStrictMode: true,

@@ -1,5 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
+import { loadEnvFile } from '@wa/core';
 import { createDb } from './client';
 
 /**
@@ -10,9 +11,14 @@ import { createDb } from './client';
  * cannot race each other through the same migration.
  */
 async function main(): Promise<void> {
+  loadEnvFile();
+
   const url = process.env.DATABASE_URL;
   if (!url) {
-    console.error('DATABASE_URL is not set.');
+    console.error(
+      'DATABASE_URL is not set.\n' +
+        'Copy .env.example to .env in the repository root and fill it in.',
+    );
     process.exit(1);
   }
 
