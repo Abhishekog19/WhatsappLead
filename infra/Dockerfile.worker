@@ -19,12 +19,15 @@ FROM base AS deps
 COPY package.json package-lock.json ./
 COPY packages/core/package.json packages/core/
 COPY packages/db/package.json packages/db/
+COPY packages/wa/package.json packages/wa/
 COPY apps/web/package.json apps/web/
 COPY apps/worker/package.json apps/worker/
 
 # Dev dependencies are kept: tsx and drizzle-kit are what actually run here.
-# --ignore-scripts skips the legacy script's Chromium download.
-RUN npm ci --ignore-scripts
+# --ignore-scripts skips the legacy script's Chromium download; --omit=optional
+# drops the legacy script's deps and the embedded Postgres used by the
+# verification suite, none of which this image runs.
+RUN npm ci --ignore-scripts --omit=optional
 
 
 # ---------- runtime -----------------------------------------------------------

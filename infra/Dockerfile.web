@@ -25,7 +25,7 @@ COPY apps/worker/package.json apps/worker/
 # --ignore-scripts: the root still carries the legacy terminal script's
 # puppeteer dependency, whose postinstall would pull a ~200 MB Chromium that
 # nothing in this image uses.
-RUN npm ci --ignore-scripts
+RUN npm ci --ignore-scripts --omit=optional
 
 
 # ---------- build -------------------------------------------------------------
