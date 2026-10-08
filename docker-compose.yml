@@ -1,0 +1,156 @@
+# The whole platform, on one host.
+#
+#   cp .env.example .env   # then fill it in
+#   docker compose up -d --build
+#
+# Five containers: Postgres, a one-shot migration, the web app, the worker, and
+# Caddy terminating TLS. Everything talks over the private `wa` network; only
+# Caddy publishes ports.
+#
+# This file lives at the repository root rather than in infra/ on purpose:
+# Compose reads variable interpolation (the ${...} below) from a .env sitting
+# next to the compose file, so keeping it here means one .env serves both the
+# interpolation and the containers' env_file. The Dockerfiles and the Caddyfile
+# stay in infra/.
+#
+# Boot order is enforced with conditions rather than hope: the migration waits
+# for Postgres to accept connections, and web and worker wait for the migration
+# to *succeed*. A failed migration therefore blocks the deploy instead of
+# leaving the app running against a half-built schema.
+#
+# Note the two database roles. `wa` is the superuser the image creates; it owns
+# the schema and runs migrations, and nothing else. The app connects as
+# `wa_app`, which is NOT a superuser — because Postgres exempts superusers from
+# row-level security, and an app connecting as one would have every
+# tenant-isolation policy silently skipped. See infra/postgres-init.sh.
+
+name: wa
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wa
+      POSTGRES_DB: wa
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      # Read by the init script below to create the unprivileged app role.
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?set POSTGRES_APP_PASSWORD in .env}
+      # Deterministic collation, so index ordering does not shift if the base
+      # image's locale data changes under us.
+      POSTGRES_INITDB_ARGS: '--locale=C --encoding=UTF8'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, on first initialisation of the volume, before anything
+      # connects. Creates wa_app.
+      - ./infra/postgres-init.sh:/docker-entrypoint-initdb.d/10-app-role.sh:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U wa -d wa']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    networks: [wa]
+
+  # One-shot. Runs drizzle's migrator, then exits 0. Uses the worker image
+  # because that is the one carrying the TypeScript sources and tsx.
+  migrate:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.worker
+    image: wa-worker:latest
+    restart: 'no'
+    command: ['node', '--import', 'tsx', 'packages/db/src/migrate.ts']
+    env_file: .env
+    environment:
+      # The owner, because migrations create tables and policies. This is the
+      # only service that connects as the superuser.
+      DATABASE_URL: postgres://wa:${POSTGRES_PASSWORD}@postgres:5432/wa
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    networks: [wa]
+
+  web:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.web
+    image: wa-web:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://wa_app:${POSTGRES_APP_PASSWORD}@postgres:5432/wa
+      # Auth.js builds its callback URLs from this. It must be the public
+      # https:// origin, or Google will reject the OAuth redirect.
+      APP_URL: https://${DOMAIN:?set DOMAIN in .env}
+      AUTH_URL: https://${DOMAIN}
+    expose:
+      - '3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    security_opt:
+      - no-new-privileges:true
+    networks: [wa]
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.worker
+    image: wa-worker:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://wa_app:${POSTGRES_APP_PASSWORD}@postgres:5432/wa
+      APP_URL: https://${DOMAIN}
+    expose:
+      - '3001'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Long enough for the in-flight job to finish; see SHUTDOWN_GRACE_MS in
+    # apps/worker/src/index.ts. Docker's default 10s would cut a send short.
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    networks: [wa]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      DOMAIN: ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates live in a volume, so a redeploy does not re-issue them and
+      # trip Let's Encrypt rate limits.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+    security_opt:
+      - no-new-privileges:true
+    networks: [wa]
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+
+networks:
+  wa:
+    driver: bridge

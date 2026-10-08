@@ -1,0 +1,54 @@
+# Caddy terminates TLS and proxies to the Next.js container.
+#
+# Certificates are obtained and renewed automatically over ACME — there is no
+# certbot cron job and no manual renewal. That is most of the reason Caddy is
+# here rather than nginx.
+#
+# {$DOMAIN} and {$ACME_EMAIL} come from the environment (see docker-compose.yml).
+
+{
+	email {$ACME_EMAIL}
+	# Uncomment while testing DNS or firewall rules, so a failed challenge does
+	# not burn the Let's Encrypt production rate limit (5 failures/hour/domain).
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	header {
+		# HSTS. Only safe once the domain is definitely serving https — which,
+		# with automatic ACME, it is from the first successful boot.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Caddy's own version is not interesting to anyone but an attacker.
+		-Server
+	}
+
+	# Server-sent events carry the pairing code and live campaign progress.
+	# Buffering them would make the UI look frozen for the length of the buffer.
+	@stream path_regexp stream ^/api/.*/stream$
+	handle @stream {
+		reverse_proxy web:3000 {
+			flush_interval -1
+			transport http {
+				# A pairing-code stream stays open for minutes at a time.
+				read_timeout 30m
+			}
+		}
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+
+	log {
+		output stdout
+		format json
+		# Request URLs can contain identifiers; keep the access log at the level
+		# where it is useful for debugging but is not a second copy of the data.
+		level INFO
+	}
+}

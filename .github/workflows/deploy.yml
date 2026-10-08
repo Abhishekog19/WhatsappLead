@@ -1,0 +1,65 @@
+name: Deploy
+
+# Runs only after CI has passed on main, so a deploy can never ship code that
+# does not typecheck or is missing a migration. Also available manually, for
+# redeploying the current main after an infrastructure change.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # `workflow_run` fires on failure too, so the conclusion has to be checked.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+
+    # Point this at a GitHub Environment to require a manual approval and to
+    # keep the SSH key out of every other workflow's reach.
+    environment:
+      name: production
+      url: https://${{ vars.DOMAIN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          # The host key is pinned rather than accepted on sight, so a
+          # hijacked DNS record cannot collect the deploy session.
+          # Capture it once with: ssh-keyscan -H <host>
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+          APP_DIR: ${{ secrets.APP_DIR }}
+        run: |
+          set -euo pipefail
+          # The script is piped from this checkout rather than run from the
+          # host's working copy: it executes before `git merge`, so it is the
+          # version that was reviewed in this commit, not whatever is on disk.
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "APP_DIR='${APP_DIR}' bash -s" < infra/deploy.sh
+
+      - name: Discard the key
+        if: always()
+        run: rm -f ~/.ssh/id_deploy

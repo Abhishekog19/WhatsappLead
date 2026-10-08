@@ -1,0 +1,24 @@
+{
+  "name": "@wa/worker",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node --import tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "verify:pipeline": "tsx src/testing/verify-pipeline.ts"
+  },
+  "dependencies": {
+    "@wa/core": "*",
+    "@wa/db": "*",
+    "@wa/wa": "*",
+    "drizzle-orm": "^0.38.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

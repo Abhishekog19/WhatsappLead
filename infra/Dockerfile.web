@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+#
+# Web tier: Next.js 15 in standalone mode.
+#
+# Three stages so a source-only change reuses the dependency layer. The runtime
+# stage carries only the traced standalone bundle — no npm, no build tools, no
+# source — which keeps the image small and the attack surface narrow.
+
+FROM node:22-alpine AS base
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    PUPPETEER_SKIP_DOWNLOAD=1
+WORKDIR /app
+
+
+# ---------- dependencies ------------------------------------------------------
+FROM base AS deps
+
+# Only the manifests, so this layer is cached until a dependency actually moves.
+COPY package.json package-lock.json ./
+COPY packages/core/package.json packages/core/
+COPY packages/db/package.json packages/db/
+COPY apps/web/package.json apps/web/
+COPY apps/worker/package.json apps/worker/
+
+# --ignore-scripts: the root still carries the legacy terminal script's
+# puppeteer dependency, whose postinstall would pull a ~200 MB Chromium that
+# nothing in this image uses.
+RUN npm ci --ignore-scripts --omit=optional
+
+
+# ---------- build -------------------------------------------------------------
+FROM base AS build
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# No build arguments for secrets on purpose: every page in this app is rendered
+# on demand, so `next build` never needs DATABASE_URL or AUTH_SECRET. Baking
+# them in would also leave them in the image layers.
+RUN npm run build --workspace=@wa/web
+
+
+# ---------- runtime -----------------------------------------------------------
+FROM base AS runtime
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+
+# Next's standalone output mirrors the monorepo layout, so the server lives at
+# apps/web/server.js and expects to be run from the bundle root.
+COPY --from=build --chown=node:node /app/apps/web/.next/standalone ./
+COPY --from=build --chown=node:node /app/apps/web/.next/static ./apps/web/.next/static
+
+USER node
+EXPOSE 3000
+
+# Compose declares the healthcheck; keeping it here too means `docker run`
+# behaves the same way.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "apps/web/server.js"]
