@@ -98,6 +98,8 @@ function AddNumberForm({
     addNumber,
     null,
   );
+  // Pairing code first, because it is the option that works with one phone.
+  const [method, setMethod] = useState<'pairing_code' | 'qr'>('pairing_code');
   const labelId = useId();
   const phoneId = useId();
   const typeId = useId();
@@ -111,10 +113,29 @@ function AddNumberForm({
       <div>
         <h2 className="font-semibold">Link a WhatsApp number</h2>
         <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
-          Use the number on the phone you have with you. You will type an
-          8-character code into WhatsApp — there is no QR code to scan.
+          This adds a linked device, the same way WhatsApp Web does. It does
+          not sign you out anywhere.
         </p>
       </div>
+
+      <fieldset>
+        <legend className="label">How do you want to link it?</legend>
+        <input type="hidden" name="linkMethod" value={method} />
+        <div className="mt-1 grid gap-2">
+          <MethodOption
+            selected={method === 'pairing_code'}
+            onSelect={() => setMethod('pairing_code')}
+            title="Type a code into WhatsApp"
+            detail="Best if this is your only phone. You get 8 characters to enter — nothing to scan."
+          />
+          <MethodOption
+            selected={method === 'qr'}
+            onSelect={() => setMethod('qr')}
+            title="Scan a QR code"
+            detail="Faster if you are on a computer with your phone beside you."
+          />
+        </div>
+      </fieldset>
 
       {state && !state.ok ? (
         <p role="alert" className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
@@ -143,12 +164,12 @@ function AddNumberForm({
 
       <div>
         <label htmlFor={phoneId} className="label">
-          WhatsApp number
+          WhatsApp number{method === 'qr' ? ' (optional)' : ''}
         </label>
         <input
           id={phoneId}
           name="phone"
-          required
+          required={method === 'pairing_code'}
           // `tel` gets the numeric keypad; the + has to be typeable, so not
           // inputMode="numeric".
           type="tel"
@@ -156,7 +177,11 @@ function AddNumberForm({
           className="input"
           autoComplete="tel"
         />
-        <p className="hint">Include the country code.</p>
+        <p className="hint">
+          {method === 'pairing_code'
+            ? 'Include the country code. The code is issued for this exact number.'
+            : 'Not needed — whichever number scans the QR is the one that gets linked.'}
+        </p>
         {state?.fieldErrors?.phone ? <FieldError>{state.fieldErrors.phone}</FieldError> : null}
       </div>
 
@@ -175,7 +200,11 @@ function AddNumberForm({
       </div>
 
       <button type="submit" disabled={pending} className="btn-primary w-full">
-        {pending ? 'Starting…' : 'Get my pairing code'}
+        {pending
+          ? 'Starting…'
+          : method === 'pairing_code'
+            ? 'Get my pairing code'
+            : 'Show me the QR code'}
       </button>
     </form>
   );
@@ -186,9 +215,12 @@ function AddNumberForm({
 interface Snapshot {
   status: string;
   phoneE164: string | null;
+  linkMethod: 'pairing_code' | 'qr';
   pairingCode: string | null;
   pairingCodeExpiresAt: string | null;
-  qrPayload: string | null;
+  /** Already a PNG data URL; the server renders it. */
+  qrImage: string | null;
+  qrExpiresAt: string | null;
   lastError: string | null;
 }
 
@@ -272,6 +304,8 @@ function PairingWatcher({
     );
   }
 
+  const usingQr = snapshot?.linkMethod === 'qr';
+
   return (
     <div className="card space-y-4">
       {snapshot?.pairingCode ? (
@@ -280,11 +314,21 @@ function PairingWatcher({
           expiresAt={snapshot.pairingCodeExpiresAt}
           sessionId={sessionId}
         />
+      ) : snapshot?.qrImage ? (
+        <QrCode
+          image={snapshot.qrImage}
+          expiresAt={snapshot.qrExpiresAt}
+          sessionId={sessionId}
+        />
       ) : (
         <div className="flex items-center gap-3">
           <Spinner />
           <div>
-            <p className="font-medium">Getting your code from WhatsApp…</p>
+            <p className="font-medium">
+              {usingQr
+                ? 'Getting your QR code from WhatsApp…'
+                : 'Getting your code from WhatsApp…'}
+            </p>
             <p className="hint">This usually takes a few seconds.</p>
           </div>
         </div>
@@ -402,6 +446,126 @@ function PairingCode({
 }
 
 // ---------------------------------------------------------------------------
+
+function QrCode({
+  image,
+  expiresAt,
+  sessionId,
+}: {
+  image: string;
+  expiresAt: string | null;
+  sessionId: string;
+}) {
+  const remaining = useCountdown(expiresAt);
+  const expired = remaining !== null && remaining <= 0;
+  const [retrying, setRetrying] = useState(false);
+  const router = useRouter();
+
+  return (
+    <div className="space-y-4">
+      <p className="font-semibold">Scan this with WhatsApp</p>
+
+      {expired ? (
+        <p
+          role="alert"
+          className="text-sm text-amber-700 dark:text-amber-300"
+        >
+          This QR code has expired. Get a new one to try again.
+        </p>
+      ) : (
+        <>
+          {/* White background unconditionally: a QR inverted by dark mode
+              will not scan. */}
+          <div className="flex justify-center rounded-2xl bg-white p-3">
+            <img
+              src={image}
+              alt="QR code for linking WhatsApp"
+              width={240}
+              height={240}
+              className="size-60"
+            />
+          </div>
+
+          <ol className="space-y-2 text-sm text-neutral-700 dark:text-neutral-300">
+            <Step n={1}>Open WhatsApp on your phone</Step>
+            <Step n={2}>
+              Go to <strong>Settings → Linked Devices</strong>
+            </Step>
+            <Step n={3}>
+              Tap <strong>Link a Device</strong> and point the camera here
+            </Step>
+          </ol>
+
+          <p className="hint tabular-nums" role="timer">
+            {remaining === null
+              ? 'Scan it soon — the code refreshes periodically.'
+              : `Refreshes in ${remaining}s`}
+          </p>
+        </>
+      )}
+
+      <button
+        type="button"
+        disabled={retrying}
+        onClick={async () => {
+          setRetrying(true);
+          await retryPairing(sessionId);
+          router.refresh();
+          setRetrying(false);
+        }}
+        className={expired ? 'btn-primary w-full' : 'btn-secondary w-full'}
+      >
+        {retrying ? 'Working…' : 'New QR code'}
+      </button>
+    </div>
+  );
+}
+
+/** A tappable card, rather than a bare radio: the detail text is the point. */
+function MethodOption({
+  selected,
+  onSelect,
+  title,
+  detail,
+}: {
+  selected: boolean;
+  onSelect: () => void;
+  title: string;
+  detail: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={selected}
+      onClick={onSelect}
+      className={`flex min-h-16 w-full items-start gap-3 rounded-xl border p-3 text-left transition-colors ${
+        selected
+          ? 'border-brand-500 bg-brand-50 dark:border-brand-500 dark:bg-brand-950'
+          : 'border-neutral-200 dark:border-neutral-800'
+      }`}
+    >
+      <span
+        aria-hidden
+        className={`mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full border-2 ${
+          selected
+            ? 'border-brand-600 dark:border-brand-400'
+            : 'border-neutral-300 dark:border-neutral-700'
+        }`}
+      >
+        {selected ? (
+          <span className="size-2.5 rounded-full bg-brand-600 dark:bg-brand-400" />
+        ) : null}
+      </span>
+      <span className="min-w-0">
+        <span className="block text-sm font-medium">{title}</span>
+        <span className="block text-xs text-neutral-600 dark:text-neutral-400">
+          {detail}
+        </span>
+      </span>
+    </button>
+  );
+}
 
 function SessionRow({
   session,

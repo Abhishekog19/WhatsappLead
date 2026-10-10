@@ -1,3 +1,4 @@
+import QRCode from 'qrcode';
 import { and, eq, isNull, waSessions } from '@wa/db';
 import { queryAsUser } from '@/server/session';
 
@@ -25,9 +26,18 @@ export const dynamic = 'force-dynamic';
 interface Snapshot {
   status: string;
   phoneE164: string | null;
+  linkMethod: 'pairing_code' | 'qr';
   pairingCode: string | null;
   pairingCodeExpiresAt: string | null;
-  qrPayload: string | null;
+  /**
+   * The QR as a PNG data URL, not the raw payload.
+   *
+   * Rendered here rather than in the browser so the client needs no QR
+   * library, and because the payload is a WhatsApp linking token — there is
+   * no reason for it to exist anywhere except inside an <img>.
+   */
+  qrImage: string | null;
+  qrExpiresAt: string | null;
   lastError: string | null;
 }
 
@@ -142,9 +152,11 @@ async function read(sessionId: string): Promise<Snapshot | null> {
       .select({
         status: waSessions.status,
         phoneE164: waSessions.phoneE164,
+        linkMethod: waSessions.linkMethod,
         pairingCode: waSessions.pairingCode,
         pairingCodeExpiresAt: waSessions.pairingCodeExpiresAt,
         qrPayload: waSessions.qrPayload,
+        qrExpiresAt: waSessions.qrExpiresAt,
         lastError: waSessions.lastError,
       })
       .from(waSessions)
@@ -163,10 +175,30 @@ async function read(sessionId: string): Promise<Snapshot | null> {
     return {
       status: row.status,
       phoneE164: row.phoneE164,
+      linkMethod: row.linkMethod,
       pairingCode: row.pairingCode,
       pairingCodeExpiresAt: row.pairingCodeExpiresAt?.toISOString() ?? null,
-      qrPayload: row.qrPayload,
+      qrImage: row.qrPayload ? await renderQr(row.qrPayload) : null,
+      qrExpiresAt: row.qrExpiresAt?.toISOString() ?? null,
       lastError: row.lastError,
     };
   });
+}
+
+/**
+ * The QR WhatsApp wants scanned, as a PNG data URL.
+ *
+ * Margin 1 rather than the default 4: on a phone the surrounding whitespace
+ * is wasted width, and WhatsApp's scanner copes fine with a tight quiet zone.
+ * Error correction stays at the library default — a QR that fails to scan is
+ * worse than a slightly denser one.
+ */
+async function renderQr(payload: string): Promise<string | null> {
+  try {
+    return await QRCode.toDataURL(payload, { margin: 1, width: 320 });
+  } catch {
+    // A malformed payload should not take the whole status stream down; the
+    // UI falls back to telling the user to request a new code.
+    return null;
+  }
 }

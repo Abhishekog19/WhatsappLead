@@ -12,6 +12,15 @@ export const accountTypeEnum = pgEnum('account_type', ['personal', 'business']);
 
 export const waEngineEnum = pgEnum('wa_engine', ['baileys', 'wwebjs']);
 
+/**
+ * How the user chose to link a number.
+ *
+ * Both work and neither is a fallback for the other: a pairing code is the
+ * only option for someone with one phone, and a QR is faster when a second
+ * screen is already in front of them.
+ */
+export const linkMethodEnum = pgEnum('link_method', ['pairing_code', 'qr']);
+
 export const waSessionStatusEnum = pgEnum('wa_session_status', [
   /** Row created, nothing linked yet. */
   'pending',

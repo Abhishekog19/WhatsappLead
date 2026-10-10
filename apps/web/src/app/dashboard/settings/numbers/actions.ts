@@ -26,9 +26,16 @@ export interface ActionResult {
 
 const addSchema = z.object({
   label: z.string().trim().min(1, 'Give this number a name.').max(60),
-  phone: z.string().trim().min(5, 'Enter the number including its country code.'),
+  // Optional for a QR link: WhatsApp reports which number scanned it. A
+  // pairing code is addressed to a specific number, so that path needs one,
+  // and the refinement below enforces it.
+  phone: z.string().trim().default(''),
+  linkMethod: z.enum(['pairing_code', 'qr']),
   accountType: z.enum(['personal', 'business']),
   defaultCountry: z.string().length(2).toUpperCase(),
+}).refine((v) => v.linkMethod === 'qr' || v.phone.length >= 5, {
+  path: ['phone'],
+  message: 'Enter the number including its country code.',
 });
 
 /** How many numbers one account may link. */
@@ -40,7 +47,8 @@ export async function addNumber(
 ): Promise<ActionResult> {
   const parsed = addSchema.safeParse({
     label: formData.get('label'),
-    phone: formData.get('phone'),
+    phone: formData.get('phone') ?? '',
+    linkMethod: formData.get('linkMethod') ?? 'pairing_code',
     accountType: formData.get('accountType') ?? 'personal',
     defaultCountry: formData.get('defaultCountry') ?? 'IN',
   });
@@ -54,23 +62,27 @@ export async function addNumber(
     return { ok: false, message: 'Check the details below.', fieldErrors };
   }
 
-  const { label, phone, accountType, defaultCountry } = parsed.data;
+  const { label, phone, linkMethod, accountType, defaultCountry } = parsed.data;
 
-  const normalised = normalizePhone(phone, defaultCountry);
-  if (!normalised.ok) {
-    return {
-      ok: false,
-      message: 'That does not look like a valid mobile number.',
-      fieldErrors: {
-        phone:
-          normalised.reason === 'invalid'
-            ? 'Not a valid number for that country. Include the country code, e.g. +91…'
-            : 'Enter a full mobile number, including the country code.',
-      },
-    };
+  // A number typed for a QR link is still worth normalising if it was given,
+  // so the duplicate check below works — but it is not required.
+  let e164: string | null = null;
+  if (phone) {
+    const normalised = normalizePhone(phone, defaultCountry);
+    if (!normalised.ok) {
+      return {
+        ok: false,
+        message: 'That does not look like a valid mobile number.',
+        fieldErrors: {
+          phone:
+            normalised.reason === 'invalid'
+              ? 'Not a valid number for that country. Include the country code, e.g. +91…'
+              : 'Enter a full mobile number, including the country code.',
+        },
+      };
+    }
+    e164 = normalised.e164;
   }
-
-  const e164 = normalised.e164;
 
   return queryAsUser(async (tx, userId) => {
     const existing = await tx
@@ -85,24 +97,26 @@ export async function addNumber(
       };
     }
 
-    const sameNumber = await tx
-      .select({ id: waSessions.id })
-      .from(waSessions)
-      .where(
-        and(
-          eq(waSessions.userId, userId),
-          eq(waSessions.phoneE164, e164),
-          isNull(waSessions.deletedAt),
-        ),
-      )
-      .limit(1);
+    if (e164) {
+      const sameNumber = await tx
+        .select({ id: waSessions.id })
+        .from(waSessions)
+        .where(
+          and(
+            eq(waSessions.userId, userId),
+            eq(waSessions.phoneE164, e164),
+            isNull(waSessions.deletedAt),
+          ),
+        )
+        .limit(1);
 
-    if (sameNumber[0]) {
-      return {
-        ok: false,
-        message: 'That number is already on your account.',
-        fieldErrors: { phone: 'Already linked.' },
-      };
+      if (sameNumber[0]) {
+        return {
+          ok: false,
+          message: 'That number is already on your account.',
+          fieldErrors: { phone: 'Already linked.' },
+        };
+      }
     }
 
     const [created] = await tx
@@ -111,9 +125,10 @@ export async function addNumber(
         userId,
         label,
         phoneE164: e164,
+        linkMethod,
         accountType,
-        // 'pending' with a phone number and no credentials is precisely the
-        // signal the worker's maintain-sessions job looks for.
+        // 'pending' with no credentials is precisely the signal the worker's
+        // maintain-sessions job looks for.
         status: 'pending',
       })
       .returning({ id: waSessions.id });
@@ -125,7 +140,11 @@ export async function addNumber(
       action: 'wa_session.create',
       entityType: 'wa_session',
       entityId: created.id,
-      metadata: { phone: maskPhone(e164), accountType },
+      metadata: {
+        phone: e164 ? maskPhone(e164) : null,
+        linkMethod,
+        accountType,
+      },
     });
 
     revalidatePath('/dashboard/settings/numbers');
@@ -143,7 +162,11 @@ export async function addNumber(
 export async function retryPairing(sessionId: string): Promise<ActionResult> {
   return queryAsUser(async (tx, userId) => {
     const rows = await tx
-      .select({ id: waSessions.id, phone: waSessions.phoneE164 })
+      .select({
+        id: waSessions.id,
+        phone: waSessions.phoneE164,
+        linkMethod: waSessions.linkMethod,
+      })
       .from(waSessions)
       .where(
         and(
@@ -155,7 +178,10 @@ export async function retryPairing(sessionId: string): Promise<ActionResult> {
       .limit(1);
 
     const row = rows[0];
-    if (!row?.phone) return { ok: false, message: 'Number not found.' };
+    if (!row) return { ok: false, message: 'Number not found.' };
+    if (row.linkMethod === 'pairing_code' && !row.phone) {
+      return { ok: false, message: 'This number has no phone number to pair with.' };
+    }
 
     await tx
       .update(waSessions)
