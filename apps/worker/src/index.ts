@@ -1,4 +1,4 @@
-import { assertTenantIsolation, sql } from '@wa/db';
+import { checkTenantIsolation, sql } from '@wa/db';
 import { createContext } from './context';
 import { startHealthServer } from './health';
 import { Scheduler } from './scheduler';
@@ -47,8 +47,27 @@ async function main(): Promise<void> {
   // connection makes every row-level security policy a no-op without any
   // visible symptom, so this is checked rather than assumed — the whole
   // product rests on one account's data never touching another's.
-  const isolation = await assertTenantIsolation(ctx.db);
-  ctx.log.info('tenant isolation enforced', { role: isolation.role });
+  //
+  // Development is allowed to continue, because a local `postgres` superuser
+  // or a provider's default role is the normal starting point and refusing to
+  // boot would just teach people to delete this check. It still runs, and
+  // still says exactly what is wrong — the finding is too easy to lose.
+  const isolation = await checkTenantIsolation(ctx.db);
+  if (isolation.ok) {
+    ctx.log.info('tenant isolation enforced', { role: isolation.role });
+  } else if (ctx.env.NODE_ENV === 'production') {
+    throw new Error(
+      `Tenant isolation is not enforced.\n\n${isolation.problems
+        .map((p) => `  - ${p}`)
+        .join('\n')}\n\nSee packages/db/drizzle/0001_rls.sql.`,
+    );
+  } else {
+    ctx.log.warn(
+      'TENANT ISOLATION IS NOT ENFORCED — one account can read another\'s data. ' +
+        'Fine for a single-user local database; this would refuse to boot in production.',
+      { role: isolation.role, problems: isolation.problems },
+    );
+  }
 
   const scheduler = new Scheduler(ctx, [
     // Order is deliberate: sockets are brought up before the sender looks for

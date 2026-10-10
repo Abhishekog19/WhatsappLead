@@ -66,6 +66,12 @@ jobs:
       - name: Verify schema and isolation
         run: npm run verify --workspace=@wa/db
 
+      # The linking handshake: three separate bugs here each left the user's
+      # phone on "Logging in…" forever, and none were visible to the type
+      # checker or to any single-step test.
+      - name: Verify linking handshake
+        run: npm run verify:linking --workspace=@wa/worker
+
       # Runs the real send job against a real database with a stubbed WhatsApp
       # socket: dedupe, suppression, the rolling cap, template rendering, and
       # the ledgers that back them.

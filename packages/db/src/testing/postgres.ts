@@ -1,3 +1,4 @@
+import { createServer } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -37,9 +38,10 @@ const APP_PASSWORD = 'verify-only';
 
 export async function startPostgres(): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'wa-verify-'));
-  // A high fixed port rather than a random one, so a leaked process from a
-  // previous run is obvious instead of silently colliding.
-  const port = 54329;
+  // Asked for from the OS rather than hard-coded. Several suites run back to
+  // back, and a shut-down Postgres does not release its port instantly — a
+  // fixed port made the second suite in a run fail to start, intermittently.
+  const port = await freePort();
 
   const pg = new EmbeddedPostgres({
     databaseDir: dir,
@@ -93,3 +95,19 @@ export async function startPostgres(): Promise<Harness> {
  * relative path to this package's drizzle/ directory.
  */
 export const MIGRATIONS_FOLDER = fileURLToPath(new URL('../../drizzle', import.meta.url));
+
+/** A port the OS says is free right now. */
+async function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.unref();
+    probe.on('error', reject);
+    // Port 0 asks the kernel to allocate; closing immediately leaves a brief
+    // window before Postgres binds it, which is fine for a local test run.
+    probe.listen(0, '127.0.0.1', () => {
+      const address = probe.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      probe.close(() => (port ? resolve(port) : reject(new Error('no free port'))));
+    });
+  });
+}
