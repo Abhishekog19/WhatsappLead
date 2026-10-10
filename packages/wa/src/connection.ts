@@ -4,6 +4,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   type WASocket,
+  type WAVersion,
 } from 'baileys';
 import {
   fromWhatsAppJid,
@@ -79,12 +80,25 @@ const RECONNECT_BASE_MS = 5_000;
 const RECONNECT_MAX_MS = 120_000;
 
 /**
- * How long a pairing code is offered for. WhatsApp's own window is shorter
- * and undocumented; this is the deadline the UI counts down to before telling
- * the user to request a fresh one.
+ * How long each linking artefact is offered for.
+ *
+ * Both are tied to Baileys' registration attempt, and `qrTimeout` is how
+ * often that attempt is renewed. A renewal invalidates whatever was issued
+ * under the previous one — which is why these are not independent numbers:
+ * showing a pairing code for 150 seconds while the registration renews every
+ * 60 would hand the user a dead code and no way to know it.
+ *
+ * So the registration window is stretched for the pairing-code flow, and the
+ * displayed deadline is set comfortably inside it. The QR flow keeps the
+ * shorter refresh, because a QR on screen is meant to rotate.
  */
+const PAIRING_REGISTRATION_MS = 180_000;
 const PAIRING_CODE_TTL_MS = 150_000;
-const QR_TTL_MS = 60_000;
+const QR_REFRESH_MS = 60_000;
+const QR_TTL_MS = QR_REFRESH_MS;
+
+/** Floor between pairing-code requests, so a chatty socket cannot spam them. */
+const PAIRING_REQUEST_FLOOR_MS = 30_000;
 
 export class WaConnection {
   private sock: WASocket | null = null;
@@ -99,6 +113,7 @@ export class WaConnection {
   /** Set when the caller wants a pairing code on the next QR opportunity. */
   private pairingPhone: string | null = null;
   private pairingRequested = false;
+  private lastPairingRequestAt = 0;
 
   constructor(private readonly opts: WaConnectionOptions) {
     this.log = opts.log.child({ sessionId: opts.sessionId });
@@ -116,25 +131,32 @@ export class WaConnection {
    * Opens the socket. Safe to call once; use {@link close} before re-opening.
    *
    * @param pairingPhone E.164 number to request a pairing code for. Pass this
-   *   only when linking a new number — an already-registered session ignores it.
+   *   only when linking by code — an already-registered session ignores it,
+   *   and a QR link does not need it.
    */
   async open(pairingPhone?: string | null): Promise<void> {
     if (this.sock) throw new Error('Connection already open');
     this.closing = false;
     this.pairingPhone = pairingPhone ?? null;
     this.pairingRequested = false;
+    this.lastPairingRequestAt = 0;
 
-    this.auth = await useDbAuthState({
-      db: this.opts.db,
-      sessionId: this.opts.sessionId,
-      encryptionKey: this.opts.encryptionKey,
-      onError: (err) => this.log.error('failed to persist auth state', { error: err }),
-    });
+    // Read from the database only once per connection object. A reconnect
+    // reuses the live state, which is what makes pairing work at all:
+    // WhatsApp closes the socket with `restartRequired` the instant a device
+    // links, and re-reading the blob here would race the write that persists
+    // the new credentials. The socket would come back unregistered and the
+    // phone would sit on "Logging in…" forever.
+    if (!this.auth) {
+      this.auth = await useDbAuthState({
+        db: this.opts.db,
+        sessionId: this.opts.sessionId,
+        encryptionKey: this.opts.encryptionKey,
+        onError: (err) => this.log.error('failed to persist auth state', { error: err }),
+      });
+    }
 
-    // Pinning to WhatsApp's current version avoids the "outdated client"
-    // disconnect; this is fetched rather than hard-coded because the server
-    // rejects versions that have fallen too far behind.
-    const { version } = await fetchLatestBaileysVersion();
+    const version = await latestVersion(this.log);
     const blog = baileysLogger(this.log, this.opts.logLevel ?? 'silent');
 
     this.sock = makeWASocket({
@@ -160,7 +182,10 @@ export class WaConnection {
       shouldSyncHistoryMessage: () => false,
 
       generateHighQualityLinkPreview: false,
-      qrTimeout: QR_TTL_MS,
+      // Longer for a pairing code: the user is reading eight characters off
+      // one screen and typing them into another, and a renewal mid-way would
+      // silently kill the code they are holding.
+      qrTimeout: this.pairingPhone ? PAIRING_REGISTRATION_MS : QR_REFRESH_MS,
       connectTimeoutMs: 45_000,
       defaultQueryTimeoutMs: 60_000,
       keepAliveIntervalMs: 25_000,
@@ -205,13 +230,21 @@ export class WaConnection {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      // A QR means the socket is ready to be linked. For the pairing-code
-      // flow we ask for the code here rather than on a timer, because
-      // requesting before the socket is ready fails with a generic error.
-      if (this.pairingPhone && !this.pairingRequested) {
-        this.pairingRequested = true;
-        await this.requestPairingCode(this.pairingPhone);
-      } else if (!this.pairingPhone) {
+      // A QR event means the socket is ready to be linked, and also that the
+      // registration attempt has just been renewed. The code is requested
+      // here rather than on a timer because asking before the socket is ready
+      // fails with a generic error.
+      if (this.pairingPhone) {
+        // Re-request on a renewal rather than letting the old code rot: the
+        // previous one stopped working the moment this event fired, so
+        // handing the user a fresh one beats showing a dead one.
+        const since = Date.now() - this.lastPairingRequestAt;
+        if (!this.pairingRequested || since > PAIRING_REQUEST_FLOOR_MS) {
+          this.pairingRequested = true;
+          this.lastPairingRequestAt = Date.now();
+          await this.requestPairingCode(this.pairingPhone);
+        }
+      } else {
         await this.setStatus('pairing');
         await this.opts.handlers.onQr(qr, new Date(Date.now() + QR_TTL_MS));
       }
@@ -283,6 +316,14 @@ export class WaConnection {
       case DisconnectReason.restartRequired: {
         // Expected immediately after a successful pairing: Baileys asks for a
         // clean restart with the new credentials.
+        //
+        // Flushing first is belt and braces. The in-memory auth state carries
+        // across the reopen, so the reconnect does not depend on this write —
+        // but if the process dies in the next second, the user would have to
+        // pair again, and they have already done their part.
+        await this.auth?.flush().catch((err) =>
+          this.log.error('failed to flush auth state before restart', { error: err }),
+        );
         this.log.info('restart required, reconnecting now');
         await this.reopen(0);
         return;
@@ -470,6 +511,9 @@ export class WaConnection {
       this.log.debug('logout call failed', { error: err });
     }
     await this.auth?.clear();
+    // Dropped so a later re-link starts from the database, which clear() has
+    // just emptied, rather than from an in-memory object this one still holds.
+    this.auth = null;
     await this.teardown();
     await this.setStatus('logged_out', 'Unlinked by the user');
   }
@@ -502,6 +546,38 @@ export class WaConnection {
 }
 
 // ---------------------------------------------------------------------------
+
+/**
+ * WhatsApp's current client version, cached process-wide.
+ *
+ * Pinning to it avoids the "outdated client" disconnect, and it is fetched
+ * rather than hard-coded because the server rejects versions that have fallen
+ * too far behind. Cached because a reconnect must not wait on a network round
+ * trip — during a backoff storm that would be one fetch per attempt per
+ * session — and because a stale-but-recent version beats failing to open at
+ * all when the lookup is unreachable.
+ */
+let cachedVersion: { value: WAVersion; fetchedAt: number } | null = null;
+const VERSION_TTL_MS = 6 * 60 * 60 * 1_000;
+
+async function latestVersion(log: Logger): Promise<WAVersion> {
+  if (cachedVersion && Date.now() - cachedVersion.fetchedAt < VERSION_TTL_MS) {
+    return cachedVersion.value;
+  }
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    cachedVersion = { value: version, fetchedAt: Date.now() };
+    return version;
+  } catch (err) {
+    if (cachedVersion) {
+      log.warn('could not refresh the WhatsApp version, using the cached one', {
+        error: err,
+      });
+      return cachedVersion.value;
+    }
+    throw err;
+  }
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

@@ -44,14 +44,19 @@ export const maintainSessions: Job = {
     summary.released = released.length;
 
     // --- 2. New link requests ---------------------------------------------
-    // A row the user created from the browser: a phone number, no credentials
-    // yet. Starting the socket is what produces a pairing code.
+    // A row the user created from the browser, with no credentials yet.
+    // Starting the socket is what produces a pairing code or a QR.
+    //
+    // A pairing code is addressed to a specific number, so one has to be on
+    // the row. A QR is not: WhatsApp tells us which number scanned it once
+    // the link completes, so phone_e164 is allowed to be NULL there.
     const pendingLinks = await asSystem(ctx.db, async (tx) =>
       tx
         .select({
           id: schema.waSessions.id,
           userId: schema.waSessions.userId,
           phoneE164: schema.waSessions.phoneE164,
+          linkMethod: schema.waSessions.linkMethod,
         })
         .from(schema.waSessions)
         .where(
@@ -59,19 +64,28 @@ export const maintainSessions: Job = {
             eq(schema.waSessions.status, 'pending'),
             isNull(schema.waSessions.deletedAt),
             isNull(schema.waSessions.credsEncrypted),
-            sql`${schema.waSessions.phoneE164} is not null`,
+            sql`(
+              ${schema.waSessions.linkMethod} = 'qr'
+              or ${schema.waSessions.phoneE164} is not null
+            )`,
           ),
         )
         .limit(5),
     );
 
     for (const session of pendingLinks) {
-      if (!session.phoneE164 || ctx.wa.has(session.id)) continue;
+      if (ctx.wa.has(session.id)) continue;
+      // Passing null is what tells the connection to wait for a QR scan
+      // instead of requesting a code.
+      const pairingPhone =
+        session.linkMethod === 'pairing_code' ? session.phoneE164 : null;
+      if (session.linkMethod === 'pairing_code' && !pairingPhone) continue;
+
       try {
         await ctx.wa.startLinking({
           id: session.id,
           userId: session.userId,
-          phoneE164: session.phoneE164,
+          phoneE164: pairingPhone,
         });
         summary.linked += 1;
       } catch (err) {
@@ -122,9 +136,27 @@ export const maintainSessions: Job = {
     // --- 4. Sockets the database no longer wants --------------------------
     // Unlinked, soft-deleted, throttled or banned elsewhere. Dropping the
     // socket releases the connection slot back to the user's own phone.
+
+    // Sessions currently pairing must be kept alive — the user may still be
+    // entering the 8-digit code on their phone.
+    const pairing = await asSystem(ctx.db, async (tx) =>
+      tx
+        .select({ id: schema.waSessions.id })
+        .from(schema.waSessions)
+        .where(
+          and(
+            eq(schema.waSessions.status, 'pairing'),
+            isNull(schema.waSessions.deletedAt),
+          ),
+        ),
+    );
+    const pairingIds = new Set(pairing.map((s) => s.id));
+
     for (const [sessionId] of Object.entries(ctx.wa.statuses())) {
       const stillWanted =
-        live.has(sessionId) || pendingLinks.some((s) => s.id === sessionId);
+        live.has(sessionId) ||
+        pendingLinks.some((s) => s.id === sessionId) ||
+        pairingIds.has(sessionId);
       if (stillWanted) continue;
       await ctx.wa.drop(sessionId);
       summary.dropped += 1;
