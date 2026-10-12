@@ -1,6 +1,6 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
-import { and, count, eq, gt, sql, waSessions, campaigns, contacts } from '@wa/db';
+import { and, count, eq, sql, waSessions, campaigns, contacts } from '@wa/db';
 import { effectiveCap, ROLLING_WINDOW_MS, type AccountType, type Tier } from '@wa/core';
 import { queryAsUser } from '@/server/session';
 import { env } from '@/server/context';
@@ -16,7 +16,18 @@ export default async function DashboardPage() {
   const data = await queryAsUser(async (tx, userId) => {
     const [sessions, activeCampaigns, contactCount] = await Promise.all([
       tx
-        .select()
+        .select({
+          id: waSessions.id,
+          label: waSessions.label,
+          phoneE164: waSessions.phoneE164,
+          status: waSessions.status,
+          accountType: waSessions.accountType,
+          tier: waSessions.tier,
+          // Convert timestamps to numbers at the boundary — raw Date objects
+          // cannot cross the RSC Flight serializer.
+          linkedAtMs: sql<number | null>`extract(epoch from ${waSessions.linkedAt}) * 1000`,
+          throttledUntilMs: sql<number | null>`extract(epoch from ${waSessions.throttledUntil}) * 1000`,
+        })
         .from(waSessions)
         .where(and(eq(waSessions.userId, userId), sql`${waSessions.deletedAt} is null`)),
       tx
@@ -31,22 +42,23 @@ export default async function DashboardPage() {
     ]);
 
     // Used quota per linked number, from the rolling-window ledger.
-    const since = new Date(Date.now() - ROLLING_WINDOW_MS);
+    // Pass an ISO string rather than a Date — makes the raw sql parameter
+    // unambiguous for postgres.js, and avoids any serialization edge cases.
+    const sinceIso = new Date(Date.now() - ROLLING_WINDOW_MS).toISOString();
     const used = sessions.length
       ? await tx.execute(sql`
           select session_id, count(*)::int as n
             from new_contact_sends
-           where user_id = ${userId} and sent_at > ${since}
+           where user_id = ${userId} and sent_at > ${sinceIso}::timestamptz
            group by session_id
         `)
       : [];
 
-    const usedBySession = new Map<string, number>(
-      (used as unknown as Array<{ session_id: string; n: number }>).map((r) => [
-        r.session_id,
-        r.n,
-      ]),
-    );
+    // Plain object, not a Map — RSC Flight cannot serialize Map instances.
+    const usedBySession: Record<string, number> = {};
+    for (const r of used as unknown as Array<{ session_id: string; n: number }>) {
+      usedBySession[r.session_id] = r.n;
+    }
 
     return {
       sessions,
@@ -71,8 +83,8 @@ export default async function DashboardPage() {
             Your WhatsApp numbers
           </h2>
           {data.sessions.map((s) => {
-            const daysSinceLink = s.linkedAt
-              ? Math.max(1, Math.ceil((Date.now() - s.linkedAt.getTime()) / 86_400_000))
+            const daysSinceLink = s.linkedAtMs
+              ? Math.max(1, Math.ceil((Date.now() - s.linkedAtMs) / 86_400_000))
               : 1;
             const cap = effectiveCap({
               accountType: s.accountType as AccountType,
@@ -87,9 +99,9 @@ export default async function DashboardPage() {
                 label={s.label}
                 phone={s.phoneE164}
                 status={s.status}
-                used={data.usedBySession.get(s.id) ?? 0}
+                used={data.usedBySession[s.id] ?? 0}
                 cap={cap}
-                throttledUntil={s.throttledUntil}
+                throttledUntilMs={s.throttledUntilMs}
               />
             );
           })}
@@ -153,17 +165,18 @@ function NumberCard({
   status,
   used,
   cap,
-  throttledUntil,
+  throttledUntilMs,
 }: {
   label: string;
   phone: string | null;
   status: string;
   used: number;
   cap: number;
-  throttledUntil: Date | null;
+  /** Epoch-ms from the DB, or null — avoids a Date crossing the RSC boundary. */
+  throttledUntilMs: number | null;
 }) {
   const remaining = Math.max(0, cap - used);
-  const holding = throttledUntil && throttledUntil.getTime() > Date.now();
+  const holding = throttledUntilMs != null && throttledUntilMs > Date.now();
 
   return (
     <div className="card">
@@ -199,7 +212,7 @@ function NumberCard({
         </div>
         <p className="hint">
           {holding
-            ? `Paused by WhatsApp until ${throttledUntil.toLocaleString()}.`
+            ? `Paused by WhatsApp until ${new Date(throttledUntilMs!).toLocaleString()}.`
             : `${remaining} more new ${remaining === 1 ? 'person' : 'people'} can be messaged right now.`}
         </p>
       </div>

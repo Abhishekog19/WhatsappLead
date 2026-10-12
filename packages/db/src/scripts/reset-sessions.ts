@@ -40,11 +40,17 @@ async function main(): Promise<void> {
              qr_expires_at = null,
              last_error = null,
              updated_at = now()
-       where status in ('pairing', 'disconnected')
+       where status in ('pending', 'pairing', 'disconnected')
          and deleted_at is null
          -- Never touch a number that genuinely linked: its credentials are
          -- real, and a 'disconnected' status there just means the socket is
          -- down and the worker should reconnect it.
+         --
+         -- 'pending' is included because of where sessions actually get
+         -- stuck: opening a socket writes a partial handshake immediately, so
+         -- a never-completed attempt sits at 'pending' WITH credentials. The
+         -- worker now starts a fresh handshake there by itself, and this is
+         -- the clean-slate option when you would rather it began from nothing.
          and linked_at is null
       returning id, phone_e164, link_method
     `;

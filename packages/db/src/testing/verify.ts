@@ -283,6 +283,63 @@ async function main(): Promise<void> {
     }
 
     // -----------------------------------------------------------------------
+    section('Date parameters in raw SQL');
+
+    // A Date handed straight to a raw-SQL parameter throws at query time:
+    // drizzle passes raw-SQL parameters to postgres-js untyped, and a Date
+    // arrives there as something it will not serialise. The message is
+    // "the string argument must be of type string… received an instance of
+    // Date", which says nothing about dates being the problem.
+    //
+    // It is invisible until the code path runs, so a page that only renders
+    // once a campaign exists ships broken. These assertions state the rule in
+    // the one place someone will look for it.
+    let dateRejected = false;
+    try {
+      await withUser(db, alice, (tx) =>
+        tx.execute(sql`select 1 from contacts where created_at > ${new Date()}`),
+      );
+    } catch {
+      dateRejected = true;
+    }
+    check('a Date object is rejected as a raw-SQL parameter', dateRejected);
+
+    const iso = new Date(Date.now() - 3_600_000).toISOString();
+
+    const inferred = await withUser(db, alice, async (tx) => {
+      const rows = await tx.execute<{ n: number }>(sql`
+        select count(*)::int as n from contacts where created_at > ${iso}
+      `);
+      return Number(rows[0]?.n ?? -1);
+    });
+    check(
+      'an ISO string works, with the type inferred from the column',
+      inferred >= 0,
+      inferred,
+    );
+
+    const cast = await withUser(db, alice, async (tx) => {
+      const rows = await tx.execute<{ n: number }>(sql`
+        select count(*)::int as n
+          from contacts
+         where created_at > ${iso}::timestamptz
+      `);
+      return Number(rows[0]?.n ?? -1);
+    });
+    check('and an explicit ::timestamptz cast works too', cast >= 0, cast);
+    check('both forms agree', inferred === cast, { inferred, cast });
+
+    // Drizzle's own operators are unaffected — they know the column type and
+    // serialise the Date themselves. Only raw SQL needs the string.
+    const viaOperator = await withUser(db, alice, (tx) =>
+      tx
+        .select({ id: schema.contacts.id })
+        .from(schema.contacts)
+        .where(sql`${schema.contacts.createdAt} > ${iso}::timestamptz`),
+    );
+    check('a typed query with a Date-shaped filter is fine', Array.isArray(viaOperator));
+
+    // -----------------------------------------------------------------------
     section('Append-only audit log');
 
     await withUser(db, alice, (tx) =>

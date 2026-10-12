@@ -19,7 +19,7 @@ import { MIGRATIONS_FOLDER, startPostgres } from '@wa/db/testing';
 import { createLogger, generateKey } from '@wa/core';
 import { useDbAuthState } from '@wa/wa';
 import { expirePairingArtifacts } from '../jobs/expire-pairing-artifacts';
-import { maintainSessions } from '../jobs/maintain-sessions';
+import { maintainSessions, resetLinkCooldowns } from '../jobs/maintain-sessions';
 import type { WorkerContext } from '../context';
 
 let passed = 0;
@@ -117,6 +117,12 @@ async function main(): Promise<void> {
       return r[0]!.id;
     });
 
+  /** One reconciliation pass, with the retry cooldown out of the way. */
+  const tick = async (ctx: WorkerContext, signal: AbortSignal) => {
+    resetLinkCooldowns();
+    return maintainSessions.run(ctx, signal);
+  };
+
   const readSession = async (id: string) =>
     asSystem(db, async (tx) => {
       const rows = await tx
@@ -196,7 +202,7 @@ async function main(): Promise<void> {
     const wa1 = recordingManager();
     const ctx1 = makeCtx(wa1);
 
-    await maintainSessions.run(ctx1, new AbortController().signal);
+    await tick(ctx1, new AbortController().signal);
     check(
       'a pending session with a number starts linking',
       wa1.calls.linked.some((l) => l.id === pairingSession),
@@ -222,8 +228,8 @@ async function main(): Promise<void> {
         .where(eq(schema.waSessions.id, pairingSession)),
     );
 
-    await maintainSessions.run(ctx1, new AbortController().signal);
-    await maintainSessions.run(ctx1, new AbortController().signal);
+    await tick(ctx1, new AbortController().signal);
+    await tick(ctx1, new AbortController().signal);
     check(
       'the socket survives repeated ticks while the user types',
       !wa1.calls.dropped.includes(pairingSession),
@@ -262,7 +268,7 @@ async function main(): Promise<void> {
 
     // The point of all that: the row is eligible again without intervention.
     const wa2 = recordingManager();
-    await maintainSessions.run(makeCtx(wa2), new AbortController().signal);
+    await tick(makeCtx(wa2), new AbortController().signal);
     check(
       'so the next tick starts a fresh attempt by itself',
       wa2.calls.linked.some((l) => l.id === pairingSession),
@@ -286,6 +292,68 @@ async function main(): Promise<void> {
     );
 
     // -----------------------------------------------------------------------
+    section('Bug 4 — the window between "socket opened" and "code issued"');
+
+    // The state a real session was found stranded in for four days:
+    // status 'pending', credentials present (the socket writes a partial
+    // handshake within milliseconds of opening), no code yet.
+    //
+    // The old job asked three separate questions — pending-without-credentials,
+    // connected, pairing — and this fell between all three. So its socket was
+    // dropped five seconds in, and nothing ever picked the row up again.
+    const stranded = await newSession({
+      phoneE164: '+919000000107',
+      status: 'pending',
+      credsEncrypted: 'partial-handshake-from-a-dead-socket',
+    });
+
+    const wa8 = recordingManager();
+    await tick(makeCtx(wa8), new AbortController().signal);
+    check(
+      'a pending session WITH a partial handshake is picked up',
+      wa8.calls.linked.some((l) => l.id === stranded),
+      wa8.calls.linked,
+    );
+    check(
+      'and is not mistaken for a linked session to reconnect',
+      !wa8.calls.resumed.includes(stranded),
+      wa8.calls.resumed,
+    );
+
+    // The other half: once a socket is open, nothing may restart it, whatever
+    // the row says. This is what protects a user mid-way through typing.
+    const wa9 = recordingManager();
+    const ctx9 = makeCtx(wa9);
+    await tick(ctx9, new AbortController().signal);
+    const startedOnce = wa9.calls.linked.length;
+    await tick(ctx9, new AbortController().signal);
+    await tick(ctx9, new AbortController().signal);
+    check(
+      'an open socket is never restarted by a later pass',
+      wa9.calls.linked.length === startedOnce,
+      { startedOnce, after: wa9.calls.linked.length },
+    );
+    check(
+      'nor dropped while its session still wants one',
+      wa9.calls.dropped.length === 0,
+      wa9.calls.dropped,
+    );
+
+    // And the cooldown has to actually hold a failing session off, or a socket
+    // that dies instantly becomes a reconnect loop.
+    const wa10 = recordingManager();
+    const ctx10 = makeCtx(wa10);
+    await maintainSessions.run(ctx10, new AbortController().signal);
+    const firstPass = wa10.calls.linked.length;
+    wa10.open.clear(); // simulate every socket dying at once
+    await maintainSessions.run(ctx10, new AbortController().signal);
+    check(
+      'a session whose socket just died is not retried immediately',
+      wa10.calls.linked.length === firstPass,
+      { firstPass, afterDeath: wa10.calls.linked.length },
+    );
+
+    // -----------------------------------------------------------------------
     section('QR linking');
 
     // A QR link has no number up front: WhatsApp reports which number scanned
@@ -293,7 +361,7 @@ async function main(): Promise<void> {
     // for this method.
     const qrSession = await newSession({ linkMethod: 'qr' });
     const wa3 = recordingManager();
-    await maintainSessions.run(makeCtx(wa3), new AbortController().signal);
+    await tick(makeCtx(wa3), new AbortController().signal);
     check(
       'a QR session with no number still starts linking',
       wa3.calls.linked.some((l) => l.id === qrSession),
@@ -307,7 +375,7 @@ async function main(): Promise<void> {
 
     const codeNoNumber = await newSession({ linkMethod: 'pairing_code' });
     const wa4 = recordingManager();
-    await maintainSessions.run(makeCtx(wa4), new AbortController().signal);
+    await tick(makeCtx(wa4), new AbortController().signal);
     check(
       'a pairing-code session with no number is left alone',
       !wa4.calls.linked.some((l) => l.id === codeNoNumber),
@@ -324,7 +392,7 @@ async function main(): Promise<void> {
       linkedAt: new Date(),
     });
     const wa5 = recordingManager();
-    await maintainSessions.run(makeCtx(wa5), new AbortController().signal);
+    await tick(makeCtx(wa5), new AbortController().signal);
     check(
       'a disconnected session with credentials is resumed',
       wa5.calls.resumed.includes(connected),
@@ -341,7 +409,7 @@ async function main(): Promise<void> {
       throttledUntil: new Date(Date.now() + 3_600_000),
     });
     const wa6 = recordingManager();
-    await maintainSessions.run(makeCtx(wa6), new AbortController().signal);
+    await tick(makeCtx(wa6), new AbortController().signal);
     check(
       'a throttled session is not resumed while the hold stands',
       !wa6.calls.resumed.includes(throttled),
@@ -355,7 +423,7 @@ async function main(): Promise<void> {
         .where(eq(schema.waSessions.id, throttled)),
     );
     const wa7 = recordingManager();
-    await maintainSessions.run(makeCtx(wa7), new AbortController().signal);
+    await tick(makeCtx(wa7), new AbortController().signal);
     const released = await readSession(throttled);
     check(
       'and is released once it does expire',

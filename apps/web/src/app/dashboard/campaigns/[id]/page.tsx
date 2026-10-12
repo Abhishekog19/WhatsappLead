@@ -118,11 +118,15 @@ export default async function CampaignPage({
         .where(eq(settings.userId, userId))
         .limit(1),
 
+      // ISO string with an explicit cast, not a Date object. drizzle hands
+      // raw-SQL parameters to postgres-js untyped, and a Date arrives there as
+      // something it will not serialise — "the string argument must be of type
+      // string… received an instance of Date", thrown at render time.
       tx.execute<{ n: number }>(sql`
         select count(*)::int as n
           from new_contact_sends
          where session_id = ${row.sessionId}
-           and sent_at > ${new Date(Date.now() - ROLLING_WINDOW_MS)}
+           and sent_at > ${new Date(Date.now() - ROLLING_WINDOW_MS).toISOString()}::timestamptz
       `),
     ]);
 
