@@ -176,10 +176,22 @@ export class WaConnection {
       // their real notifications while a campaign runs.
       markOnlineOnConnect: false,
 
-      // We never read old chats, only send and watch for replies. Skipping
-      // history sync saves a large download and a lot of memory per session.
+      // Do not ASK for the full history: that is a large download this product
+      // has no use for, since it only sends and watches for replies.
       syncFullHistory: false,
-      shouldSyncHistoryMessage: () => false,
+
+      // But do process the initial sync that arrives anyway. Refusing it with
+      // `shouldSyncHistoryMessage: () => false` looks like the obvious
+      // companion to the line above, and Baileys warns against it in capitals:
+      // that notification is what carries the initial LID mappings, and
+      // without them the library is left guessing how to address accounts —
+      // "instability and session errors", which for a sender means messages
+      // that fail or go to the wrong place.
+      //
+      // With syncFullHistory off, what WhatsApp sends is a recent slice rather
+      // than everything, so the cost of accepting it is small and the cost of
+      // refusing it is a class of bug that would be very hard to trace back
+      // here.
 
       generateHighQualityLinkPreview: false,
       // Longer for a pairing code: the user is reading eight characters off

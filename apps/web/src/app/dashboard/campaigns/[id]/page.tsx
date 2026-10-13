@@ -24,6 +24,7 @@ import { settings } from '@wa/db';
 import { queryAsUser } from '@/server/session';
 import { env } from '@/server/context';
 import { CampaignControls } from './campaign-controls';
+import { LiveProgress } from './live-progress';
 
 export const metadata: Metadata = { title: 'Campaign' };
 
@@ -142,9 +143,12 @@ export default async function CampaignPage({
   if (!data) notFound();
 
   const c = data.campaign;
-  const done = c.sentCount + c.failedCount + c.skippedCount;
-  const pct = c.totalTargets > 0 ? Math.round((done / c.totalTargets) * 100) : 0;
-  const remaining = Math.max(0, c.totalTargets - done);
+  // The progress figures live in LiveProgress now; this is only needed for
+  // the controls, which ask how many messages a cancel would drop.
+  const remaining = Math.max(
+    0,
+    c.totalTargets - (c.sentCount + c.failedCount + c.skippedCount),
+  );
 
   const window = data.prefs
     ? {
@@ -194,36 +198,26 @@ export default async function CampaignPage({
         </p>
       </div>
 
-      <section className="card">
-        <div className="flex items-baseline justify-between gap-3">
-          <p className="text-sm text-neutral-600 dark:text-neutral-400">Progress</p>
-          <p className="text-sm font-semibold tabular-nums">{pct}%</p>
-        </div>
-        <div
-          role="progressbar"
-          aria-valuenow={done}
-          aria-valuemin={0}
-          aria-valuemax={c.totalTargets}
-          aria-label="Campaign progress"
-          className="mt-2 h-2.5 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800"
-        >
-          <div
-            className="h-full rounded-full bg-brand-500 transition-[width]"
-            style={{ width: `${pct}%` }}
-          />
-        </div>
-
-        <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
-          <Figure label="Sent" value={c.sentCount} />
-          <Figure label="Replies" value={c.replyCount} />
-          <Figure label="Remaining" value={remaining} />
-          <Figure label="Skipped" value={c.skippedCount} />
-          {c.failedCount > 0 ? <Figure label="Failed" value={c.failedCount} /> : null}
-          {cap !== null ? (
-            <Figure label="Today's quota" text={`${data.used} / ${cap}`} />
-          ) : null}
-        </dl>
-      </section>
+      <LiveProgress
+        campaignId={c.id}
+        capLabel={cap !== null ? `${data.used} / ${cap}` : null}
+        initial={{
+          status: c.status,
+          totalTargets: c.totalTargets,
+          sentCount: c.sentCount,
+          failedCount: c.failedCount,
+          skippedCount: c.skippedCount,
+          replyCount: c.replyCount,
+          pauseReason: c.pauseReason,
+          latest: data.recent
+            .filter((t) => t.status === 'sent' && t.sentAt)
+            .map((t) => ({
+              name: t.contactName,
+              phoneE164: t.contactPhone,
+              sentAt: t.sentAt!.toISOString(),
+            }))[0] ?? null,
+        }}
+      />
 
       {explanation ? (
         <div
@@ -406,24 +400,6 @@ function explainQuiet(input: {
   };
 }
 
-function Figure({
-  label,
-  value,
-  text,
-}: {
-  label: string;
-  value?: number;
-  text?: string;
-}) {
-  return (
-    <div>
-      <dt className="text-xs text-neutral-500">{label}</dt>
-      <dd className="mt-0.5 text-lg font-bold tabular-nums">
-        {text ?? (value ?? 0).toLocaleString()}
-      </dd>
-    </div>
-  );
-}
 
 const SKIP_LABEL: Record<string, string> = {
   duplicate: 'Already messaged',

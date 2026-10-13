@@ -12,7 +12,7 @@
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
-import { sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { createDb } from '../client';
 import { checkTenantIsolation } from '../isolation';
 import { asSystem, withUser } from '../tenant';
@@ -281,6 +281,95 @@ async function main(): Promise<void> {
     } finally {
       await memberDb.sql.end({ timeout: 5 }).catch(() => undefined);
     }
+
+    // -----------------------------------------------------------------------
+    section('Column qualification in raw SQL');
+
+    // Drizzle renders ${table.column} inside a raw `sql` fragment WITHOUT a
+    // table qualifier when the statement has no join: "id", not
+    // "templates"."id". At the top level that is unambiguous. Inside a
+    // subquery that introduces another table it is not — the bare name binds
+    // to the INNER table — and the query returns a confidently wrong number
+    // with no error.
+    //
+    // This cost a working feature: the campaign form counted a template's
+    // usable variants with such a subquery, compiled it to
+    // `where v.template_id = v.id`, got zero, and told a user they had not
+    // written a message while they were looking at it.
+    //
+    // Both halves are asserted, because the trap is that the broken form is
+    // the one that reads more naturally.
+    const tplId = await withUser(db, alice, async (tx) => {
+      const t = await tx
+        .insert(schema.templates)
+        .values({ userId: alice, name: 'Qualification' })
+        .returning({ id: schema.templates.id });
+      const id = t[0]!.id;
+      await tx.insert(schema.templateVariants).values([
+        { templateId: id, userId: alice, body: 'one', position: 0 },
+        { templateId: id, userId: alice, body: 'two', position: 1 },
+      ]);
+      return id;
+    });
+
+    const rendered = db
+      .select({
+        n: sql<number>`(select count(*)::int from ${schema.templateVariants} v
+                        where v.template_id = ${schema.templates.id})`,
+      })
+      .from(schema.templates)
+      .toSQL().sql;
+    check(
+      'an unjoined column renders unqualified, which is the trap',
+      rendered.includes('v.template_id = "id"'),
+      rendered,
+    );
+
+    const viaSubquery = await withUser(db, alice, async (tx) => {
+      const rows = await tx
+        .select({
+          n: sql<number>`(select count(*)::int from ${schema.templateVariants} v
+                          where v.template_id = ${schema.templates.id})`,
+        })
+        .from(schema.templates)
+        .where(sql`${schema.templates.id} = ${tplId}`);
+      return Number(rows[0]?.n ?? -1);
+    });
+    check(
+      'and silently counts zero instead of failing',
+      viaSubquery === 0,
+      viaSubquery,
+    );
+
+    const viaJoin = await withUser(db, alice, async (tx) => {
+      const rows = await tx
+        .select({ n: sql<number>`count(${schema.templateVariants.id})::int` })
+        .from(schema.templates)
+        .leftJoin(
+          schema.templateVariants,
+          eq(schema.templateVariants.templateId, schema.templates.id),
+        )
+        .where(eq(schema.templates.id, tplId))
+        .groupBy(schema.templates.id);
+      return Number(rows[0]?.n ?? -1);
+    });
+    check('the join form gets the right answer', viaJoin === 2, viaJoin);
+
+    // A join puts both tables in scope, so drizzle qualifies both — which is
+    // what makes the form above safe as well as correct.
+    const joinSql = db
+      .select({ n: sql<number>`count(${schema.templateVariants.id})::int` })
+      .from(schema.templates)
+      .leftJoin(
+        schema.templateVariants,
+        eq(schema.templateVariants.templateId, schema.templates.id),
+      )
+      .toSQL().sql;
+    check(
+      'because a join makes drizzle qualify columns',
+      joinSql.includes('"template_variants"."id"'),
+      joinSql,
+    );
 
     // -----------------------------------------------------------------------
     section('Date parameters in raw SQL');

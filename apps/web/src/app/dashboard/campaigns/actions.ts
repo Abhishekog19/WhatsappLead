@@ -358,7 +358,26 @@ export async function cancelCampaign(campaignId: string): Promise<CampaignResult
   });
 }
 
-/** Options for the campaign form. */
+/**
+ * Options for the campaign form.
+ *
+ * The two counts here are aggregates over a LEFT JOIN rather than correlated
+ * subqueries, and that is not a style preference.
+ *
+ * Drizzle renders `${table.column}` inside a raw `sql` fragment WITHOUT a
+ * table qualifier when the statement has no join — `"id"`, not
+ * `"templates"."id"`. At the top level that is unambiguous and fine. Inside a
+ * subquery that introduces another table it is not: the bare name binds to the
+ * INNER table instead, so `where v.template_id = ${templates.id}` compiles to
+ * `where v.template_id = v.id` and counts zero, every time.
+ *
+ * It does not error. It returns a confidently wrong number, which here meant
+ * the form reporting "you have not written a message yet" to a user looking at
+ * the message they had just written.
+ *
+ * A join puts both tables in scope, so drizzle qualifies both, and the whole
+ * thing is one pass instead of a subquery per row.
+ */
 export async function loadCampaignOptions() {
   return queryAsUser(async (tx, userId) => {
     const [sessions, lists, messages] = await Promise.all([
@@ -380,29 +399,33 @@ export async function loadCampaignOptions() {
           rowsImported: contactLists.rowsImported,
           // How many of this list have never been messaged — the number that
           // actually determines how long the campaign will take.
-          unmessaged: sql<number>`(
-            select count(*)::int from ${contacts} c
-             where c.user_id = ${userId}
-               and c.list_id = ${contactLists.id}
-               and c.last_messaged_at is null
-          )`,
+          unmessaged: sql<number>`count(${contacts.id}) filter (
+            where ${contacts.lastMessagedAt} is null
+          )::int`,
         })
         .from(contactLists)
-        .where(and(eq(contactLists.userId, userId), isNull(contactLists.deletedAt))),
+        .leftJoin(
+          contacts,
+          and(eq(contacts.listId, contactLists.id), eq(contacts.userId, userId)),
+        )
+        .where(and(eq(contactLists.userId, userId), isNull(contactLists.deletedAt)))
+        // Grouping by the primary key is enough: Postgres knows the other
+        // selected columns are functionally dependent on it.
+        .groupBy(contactLists.id),
 
       tx
         .select({
           id: templates.id,
           name: templates.name,
-          variants: sql<number>`(
-            select count(*)::int from ${templateVariants} v
-             where v.template_id = ${templates.id}
-               and v.weight > 0
-               and length(trim(v.body)) > 0
-          )`,
+          variants: sql<number>`count(${templateVariants.id}) filter (
+            where ${templateVariants.weight} > 0
+              and length(trim(${templateVariants.body})) > 0
+          )::int`,
         })
         .from(templates)
-        .where(and(eq(templates.userId, userId), isNull(templates.deletedAt))),
+        .leftJoin(templateVariants, eq(templateVariants.templateId, templates.id))
+        .where(and(eq(templates.userId, userId), isNull(templates.deletedAt)))
+        .groupBy(templates.id),
     ]);
 
     return { sessions, lists, messages };
