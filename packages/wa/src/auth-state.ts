@@ -23,8 +23,18 @@ import { asSystem, schema, type Database } from '@wa/db';
  * well under a megabyte and a single column keeps the "losing this means
  * re-pairing" story in one obvious place.
  *
- * Writes are coalesced: Baileys calls `keys.set` several times per message,
- * and each call would otherwise be its own encrypt-and-UPDATE round trip.
+ * Two kinds of update, written differently on purpose:
+ *
+ *   creds.update  fires a handful of times, and the time it matters most is
+ *                 the instant a pairing completes. Written immediately.
+ *   keys.set      fires several times per message as Signal sessions churn.
+ *                 Coalesced, or every send becomes several encrypt-and-UPDATE
+ *                 round trips.
+ *
+ * Debouncing the first kind is what broke pairing: WhatsApp closes the socket
+ * with `restartRequired` the moment a device is linked, the reconnect read the
+ * blob back before the debounced write had landed, and the fresh socket came
+ * up unregistered while the phone sat on "Logging in…" forever.
  */
 
 /** What actually gets serialised. Signal keys are grouped by type. */
@@ -35,15 +45,16 @@ interface StoredState {
 
 export interface DbAuthState {
   state: AuthenticationState;
-  /** Baileys calls this on `creds.update`. Schedules a coalesced write. */
+  /** Baileys calls this on `creds.update`. Writes without waiting. */
   saveCreds: () => Promise<void>;
-  /** Writes immediately, bypassing the debounce. Call before shutdown. */
+  /** Writes anything outstanding. Call before a reconnect or shutdown. */
   flush: () => Promise<void>;
   /** Drops persisted credentials — used when WhatsApp reports a logout. */
   clear: () => Promise<void>;
 }
 
-const WRITE_DEBOUNCE_MS = 1_000;
+/** Only applies to signal-key churn; credentials are never delayed. */
+const KEY_WRITE_DEBOUNCE_MS = 1_000;
 
 export async function useDbAuthState(params: {
   db: Database;
@@ -72,12 +83,12 @@ export async function useDbAuthState(params: {
     stored = { creds: initAuthCreds(), keys: {} };
   }
 
-  let pending: NodeJS.Timeout | null = null;
-  let inFlight: Promise<void> | null = null;
-  let dirty = false;
+  let debounce: NodeJS.Timeout | null = null;
+  // Writes are chained rather than fired in parallel: two encrypts racing to
+  // UPDATE the same row can land out of order and persist older state.
+  let queue: Promise<void> = Promise.resolve();
 
   async function write(): Promise<void> {
-    dirty = false;
     const payload = encrypt(JSON.stringify(stored, BufferJSON.replacer), encryptionKey);
     await asSystem(db, async (tx) => {
       await tx
@@ -87,18 +98,25 @@ export async function useDbAuthState(params: {
     });
   }
 
+  function enqueue(): Promise<void> {
+    if (debounce) {
+      clearTimeout(debounce);
+      debounce = null;
+    }
+    queue = queue.then(write).catch((err) => {
+      // Never throw into Baileys' event loop: a failed credential write must
+      // not tear down a live socket. The next update retries it.
+      onError?.(err);
+    });
+    return queue;
+  }
+
   function schedule(): void {
-    dirty = true;
-    if (pending) return;
-    pending = setTimeout(() => {
-      pending = null;
-      inFlight = write().catch((err) => {
-        // Never throw into Baileys' event loop: a failed credential write must
-        // not tear down a live socket. The next update retries it.
-        dirty = true;
-        onError?.(err);
-      });
-    }, WRITE_DEBOUNCE_MS);
+    if (debounce) return;
+    debounce = setTimeout(() => {
+      debounce = null;
+      void enqueue();
+    }, KEY_WRITE_DEBOUNCE_MS);
   }
 
   const state: AuthenticationState = {
@@ -137,32 +155,29 @@ export async function useDbAuthState(params: {
   return {
     state,
 
-    saveCreds: async () => {
-      schedule();
-    },
+    // Not debounced. See the note at the top of the file: the one moment this
+    // has to be durable is the moment a pairing lands.
+    saveCreds: () => enqueue(),
 
-    flush: async () => {
-      if (pending) {
-        clearTimeout(pending);
-        pending = null;
-      }
-      if (inFlight) await inFlight.catch(() => undefined);
-      if (dirty) await write();
-    },
+    flush: () => enqueue(),
 
     clear: async () => {
-      if (pending) {
-        clearTimeout(pending);
-        pending = null;
+      if (debounce) {
+        clearTimeout(debounce);
+        debounce = null;
       }
-      dirty = false;
       stored = { creds: initAuthCreds(), keys: {} };
-      await asSystem(db, async (tx) => {
-        await tx
-          .update(schema.waSessions)
-          .set({ credsEncrypted: null, updatedAt: new Date() })
-          .where(eq(schema.waSessions.id, sessionId));
+      // Queued behind anything still in flight, so a late write cannot
+      // resurrect the credentials we just dropped.
+      queue = queue.then(async () => {
+        await asSystem(db, async (tx) => {
+          await tx
+            .update(schema.waSessions)
+            .set({ credsEncrypted: null, updatedAt: new Date() })
+            .where(eq(schema.waSessions.id, sessionId));
+        });
       });
+      await queue;
     },
   };
 }

@@ -12,7 +12,13 @@ import {
   uuid,
 } from 'drizzle-orm/pg-core';
 import { users } from './auth';
-import { accountTypeEnum, dedupeModeEnum, waEngineEnum, waSessionStatusEnum } from './enums';
+import {
+  accountTypeEnum,
+  dedupeModeEnum,
+  linkMethodEnum,
+  waEngineEnum,
+  waSessionStatusEnum,
+} from './enums';
 
 /**
  * Per-user preferences. Exactly one row per user, created on first login.
@@ -78,7 +84,13 @@ export const waSessions = pgTable(
       .references(() => users.id, { onDelete: 'cascade' }),
 
     label: text('label').notNull().default('My WhatsApp'),
+    /**
+     * NULL until a QR link completes and WhatsApp tells us which number it
+     * was. Required up front for a pairing code, which is addressed to a
+     * specific number.
+     */
     phoneE164: text('phone_e164'),
+    linkMethod: linkMethodEnum('link_method').notNull().default('pairing_code'),
     accountType: accountTypeEnum('account_type').notNull().default('personal'),
     engine: waEngineEnum('engine').notNull().default('baileys'),
     status: waSessionStatusEnum('status').notNull().default('pending'),

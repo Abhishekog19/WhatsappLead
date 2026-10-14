@@ -30,18 +30,32 @@ const TIMEZONES = [
   'UTC',
 ];
 
+/**
+ * Every field here is an uncontrolled input reading `defaultValue`, and React
+ * does not update a mounted input when its defaultValue prop changes. So after
+ * a save, the server re-rendered with the new settings and the form carried on
+ * showing the old ones — and on the next full page load the inputs reset to
+ * whatever the fresh props said, which looked exactly like the save having
+ * been silently reverted. It had not: the database had the new hours all
+ * along.
+ *
+ * Keying the fields on the saved values makes React remount them when the
+ * server's idea of the settings changes, which is the one moment the inputs
+ * should be reset. The status banner lives outside that subtree so the
+ * "Saved" message survives the remount.
+ *
+ * Controlled inputs would also work, but that means mirroring a dozen fields
+ * into state and keeping them in sync, to solve a problem that only exists for
+ * one frame after a save.
+ */
 export function SettingsForm({ values }: { values: SettingsValues }) {
   const [state, action, pending] = useActionState<SaveResult | null, FormData>(
     saveSettings,
     null,
   );
 
-  // Controlled only where the UI needs to react — showing the cooldown field
-  // depends on the selected dedupe mode.
-  const [dedupeMode, setDedupeMode] = useState(values.dedupeMode);
-
   return (
-    <form action={action} className="space-y-6">
+    <div className="space-y-6">
       {state ? (
         <p
           role="status"
@@ -54,6 +68,35 @@ export function SettingsForm({ values }: { values: SettingsValues }) {
           {state.message}
         </p>
       ) : null}
+
+      <SettingsFields
+        key={JSON.stringify(values)}
+        values={values}
+        action={action}
+        pending={pending}
+        state={state}
+      />
+    </div>
+  );
+}
+
+function SettingsFields({
+  values,
+  action,
+  pending,
+  state,
+}: {
+  values: SettingsValues;
+  action: (formData: FormData) => void;
+  pending: boolean;
+  state: SaveResult | null;
+}) {
+  // Controlled only where the UI needs to react — showing the cooldown field
+  // depends on the selected dedupe mode.
+  const [dedupeMode, setDedupeMode] = useState(values.dedupeMode);
+
+  return (
+    <form action={action} className="space-y-6">
 
       <Fieldset
         legend="Don't message the same person twice"

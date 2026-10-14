@@ -107,6 +107,9 @@ jspm_packages/
 
 # Next.js build output
 .next
+# Builds run while the dev server is up go here instead, so they cannot
+# clobber its state. See distDir in apps/web/next.config.ts.
+.next-verify
 out
 
 # Nuxt.js build / generate output

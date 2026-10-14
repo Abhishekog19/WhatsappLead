@@ -8,7 +8,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "node --import tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "verify:pipeline": "tsx src/testing/verify-pipeline.ts"
+    "verify:pipeline": "tsx src/testing/verify-pipeline.ts",
+    "verify:linking": "tsx src/testing/verify-linking.ts"
   },
   "dependencies": {
     "@wa/core": "*",

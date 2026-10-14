@@ -12,9 +12,10 @@
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
-import { sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { createDb } from '../client';
 import { checkTenantIsolation } from '../isolation';
+import { workerStatus } from '../worker-status';
 import { asSystem, withUser } from '../tenant';
 import * as schema from '../schema';
 import { startPostgres } from './postgres';
@@ -59,7 +60,32 @@ async function main(): Promise<void> {
        where table_schema = 'public' and table_type = 'BASE TABLE'
     `);
     // drizzle's own bookkeeping table lives in the `drizzle` schema, not here.
-    check('18 tables created', Number(tables[0]?.n) === 18, tables[0]);
+    check('19 tables created', Number(tables[0]?.n) === 19, tables[0]);
+
+    // worker_heartbeats is deliberately NOT a tenant table: it is
+    // infrastructure, holds no personal data, and every account depends on the
+    // same workers. Asserted so that "it has no RLS" stays a decision rather
+    // than becoming an oversight someone finds later.
+    const heartbeatTable = await owner.db.execute<{
+      rls: boolean;
+      has_user_id: boolean;
+    }>(sql`
+      select c.relrowsecurity as rls,
+             exists (
+               select 1 from information_schema.columns
+                where table_schema = 'public'
+                  and table_name = 'worker_heartbeats'
+                  and column_name = 'user_id'
+             ) as has_user_id
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = 'public' and c.relname = 'worker_heartbeats'
+    `);
+    check(
+      'worker_heartbeats carries no tenant column and no RLS, by design',
+      heartbeatTable[0]?.rls === false && heartbeatTable[0]?.has_user_id === false,
+      heartbeatTable[0],
+    );
 
     const forced = await owner.db.execute<{ relname: string }>(sql`
       select c.relname from pg_class c
@@ -281,6 +307,192 @@ async function main(): Promise<void> {
     } finally {
       await memberDb.sql.end({ timeout: 5 }).catch(() => undefined);
     }
+
+    // -----------------------------------------------------------------------
+    section('Worker liveness');
+
+    const noWorker = await workerStatus(owner.db);
+    check(
+      'with no heartbeat at all, no worker is reported alive',
+      noWorker.alive === false && noWorker.lastSeenAt === null,
+      noWorker,
+    );
+
+    await owner.db.execute(sql`
+      insert into worker_heartbeats (worker_id, last_seen_at, open_sessions)
+      values ('fresh', now(), 2)
+    `);
+    const live = await workerStatus(owner.db);
+    check(
+      'a recent heartbeat reports alive, with its socket count',
+      live.alive && live.liveWorkers === 1 && live.openSessions === 2,
+      live,
+    );
+
+    // The window matters: too short and a worker busy with a slow job looks
+    // dead, too long and someone who forgot to start it waits for the news.
+    await owner.db.execute(sql`
+      update worker_heartbeats
+         set last_seen_at = now() - interval '90 seconds' where worker_id = 'fresh'
+    `);
+    const stale = await workerStatus(owner.db);
+    check(
+      'a heartbeat older than the window is not trusted',
+      stale.alive === false && stale.lastSeenAt !== null,
+      stale,
+    );
+    check(
+      'but the last-seen time is still reported, so the UI can say when',
+      stale.lastSeenAt instanceof Date,
+    );
+
+    await owner.db.execute(sql`delete from worker_heartbeats`);
+
+    // -----------------------------------------------------------------------
+    section('Column qualification in raw SQL');
+
+    // Drizzle renders ${table.column} inside a raw `sql` fragment WITHOUT a
+    // table qualifier when the statement has no join: "id", not
+    // "templates"."id". At the top level that is unambiguous. Inside a
+    // subquery that introduces another table it is not — the bare name binds
+    // to the INNER table — and the query returns a confidently wrong number
+    // with no error.
+    //
+    // This cost a working feature: the campaign form counted a template's
+    // usable variants with such a subquery, compiled it to
+    // `where v.template_id = v.id`, got zero, and told a user they had not
+    // written a message while they were looking at it.
+    //
+    // Both halves are asserted, because the trap is that the broken form is
+    // the one that reads more naturally.
+    const tplId = await withUser(db, alice, async (tx) => {
+      const t = await tx
+        .insert(schema.templates)
+        .values({ userId: alice, name: 'Qualification' })
+        .returning({ id: schema.templates.id });
+      const id = t[0]!.id;
+      await tx.insert(schema.templateVariants).values([
+        { templateId: id, userId: alice, body: 'one', position: 0 },
+        { templateId: id, userId: alice, body: 'two', position: 1 },
+      ]);
+      return id;
+    });
+
+    const rendered = db
+      .select({
+        n: sql<number>`(select count(*)::int from ${schema.templateVariants} v
+                        where v.template_id = ${schema.templates.id})`,
+      })
+      .from(schema.templates)
+      .toSQL().sql;
+    check(
+      'an unjoined column renders unqualified, which is the trap',
+      rendered.includes('v.template_id = "id"'),
+      rendered,
+    );
+
+    const viaSubquery = await withUser(db, alice, async (tx) => {
+      const rows = await tx
+        .select({
+          n: sql<number>`(select count(*)::int from ${schema.templateVariants} v
+                          where v.template_id = ${schema.templates.id})`,
+        })
+        .from(schema.templates)
+        .where(sql`${schema.templates.id} = ${tplId}`);
+      return Number(rows[0]?.n ?? -1);
+    });
+    check(
+      'and silently counts zero instead of failing',
+      viaSubquery === 0,
+      viaSubquery,
+    );
+
+    const viaJoin = await withUser(db, alice, async (tx) => {
+      const rows = await tx
+        .select({ n: sql<number>`count(${schema.templateVariants.id})::int` })
+        .from(schema.templates)
+        .leftJoin(
+          schema.templateVariants,
+          eq(schema.templateVariants.templateId, schema.templates.id),
+        )
+        .where(eq(schema.templates.id, tplId))
+        .groupBy(schema.templates.id);
+      return Number(rows[0]?.n ?? -1);
+    });
+    check('the join form gets the right answer', viaJoin === 2, viaJoin);
+
+    // A join puts both tables in scope, so drizzle qualifies both — which is
+    // what makes the form above safe as well as correct.
+    const joinSql = db
+      .select({ n: sql<number>`count(${schema.templateVariants.id})::int` })
+      .from(schema.templates)
+      .leftJoin(
+        schema.templateVariants,
+        eq(schema.templateVariants.templateId, schema.templates.id),
+      )
+      .toSQL().sql;
+    check(
+      'because a join makes drizzle qualify columns',
+      joinSql.includes('"template_variants"."id"'),
+      joinSql,
+    );
+
+    // -----------------------------------------------------------------------
+    section('Date parameters in raw SQL');
+
+    // A Date handed straight to a raw-SQL parameter throws at query time:
+    // drizzle passes raw-SQL parameters to postgres-js untyped, and a Date
+    // arrives there as something it will not serialise. The message is
+    // "the string argument must be of type string… received an instance of
+    // Date", which says nothing about dates being the problem.
+    //
+    // It is invisible until the code path runs, so a page that only renders
+    // once a campaign exists ships broken. These assertions state the rule in
+    // the one place someone will look for it.
+    let dateRejected = false;
+    try {
+      await withUser(db, alice, (tx) =>
+        tx.execute(sql`select 1 from contacts where created_at > ${new Date()}`),
+      );
+    } catch {
+      dateRejected = true;
+    }
+    check('a Date object is rejected as a raw-SQL parameter', dateRejected);
+
+    const iso = new Date(Date.now() - 3_600_000).toISOString();
+
+    const inferred = await withUser(db, alice, async (tx) => {
+      const rows = await tx.execute<{ n: number }>(sql`
+        select count(*)::int as n from contacts where created_at > ${iso}
+      `);
+      return Number(rows[0]?.n ?? -1);
+    });
+    check(
+      'an ISO string works, with the type inferred from the column',
+      inferred >= 0,
+      inferred,
+    );
+
+    const cast = await withUser(db, alice, async (tx) => {
+      const rows = await tx.execute<{ n: number }>(sql`
+        select count(*)::int as n
+          from contacts
+         where created_at > ${iso}::timestamptz
+      `);
+      return Number(rows[0]?.n ?? -1);
+    });
+    check('and an explicit ::timestamptz cast works too', cast >= 0, cast);
+    check('both forms agree', inferred === cast, { inferred, cast });
+
+    // Drizzle's own operators are unaffected — they know the column type and
+    // serialise the Date themselves. Only raw SQL needs the string.
+    const viaOperator = await withUser(db, alice, (tx) =>
+      tx
+        .select({ id: schema.contacts.id })
+        .from(schema.contacts)
+        .where(sql`${schema.contacts.createdAt} > ${iso}::timestamptz`),
+    );
+    check('a typed query with a Date-shaped filter is fine', Array.isArray(viaOperator));
 
     // -----------------------------------------------------------------------
     section('Append-only audit log');

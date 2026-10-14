@@ -12,6 +12,17 @@ import type { Job } from '../scheduler';
  *
  * A session left in `pairing` with nothing to show is moved back to `pending`,
  * which is what the UI renders as "not linked yet — start again".
+ *
+ * That reset also has to clear the credentials, and this is the subtle part.
+ * Opening a socket writes a partial handshake (noise keys, a registration id)
+ * long before anything is linked, so the column is non-NULL even though the
+ * pairing never completed. maintain-sessions only picks up a `pending` row
+ * whose credentials are NULL — it has no other way to tell "waiting to be
+ * linked" from "linked and should reconnect" — so leaving them behind strands
+ * the row in a state nothing acts on. The user sees "Starting" forever.
+ *
+ * Gated on `linked_at is null`, so this can never discard the credentials of
+ * a number that genuinely did link.
  */
 export const expirePairingArtifacts: Job = {
   name: 'expire-pairing-artifacts',
@@ -38,10 +49,14 @@ export const expirePairingArtifacts: Job = {
             or (qr_payload is not null and qr_expires_at <= now())
         returning id`);
 
-      // Nothing left to show and never linked: drop back to 'pending'.
+      // Nothing left to show and never linked: drop back to 'pending' and
+      // discard the half-finished handshake, so the row is eligible again.
       const reset = await tx.execute(sql`
         update wa_sessions
-           set status = 'pending', updated_at = now()
+           set status = 'pending',
+               creds_encrypted = null,
+               last_error = 'The code expired before it was used',
+               updated_at = now()
          where status = 'pairing'
            and pairing_code is null
            and qr_payload is null

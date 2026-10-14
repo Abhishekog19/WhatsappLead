@@ -47,7 +47,12 @@ into WhatsApp on the same phone you are browsing from.
 > **Link with phone number instead**
 
 No camera, no second screen, nothing to photograph. This is why the platform is
-usable from a phone alone, and it is the flow the UI is built around.
+usable from a phone alone.
+
+Both methods are offered, and neither is a fallback for the other — you pick
+one when you add a number. The code is the only option on a single phone; a QR
+is quicker when a laptop is already open with the phone beside it. A QR link
+does not even ask for the number, since WhatsApp reports which one scanned it.
 
 ## The spreadsheet
 
@@ -209,10 +214,34 @@ npm run dev          # web, on http://localhost:3000
 npm run dev:worker   # in a second terminal
 ```
 
-If `DATABASE_URL` points at a role that is a superuser — which includes the
-default `postgres` user and a plain `docker run postgres` — the worker will
-refuse to start and tell you why. That is deliberate: see
-[What is actually proven](#what-is-actually-proven).
+### One thing to know about hosted Postgres
+
+Most managed providers hand you a role that **bypasses row-level security**.
+Neon's `neondb_owner` has `BYPASSRLS` outright; a plain `docker run postgres`
+and the default local `postgres` user are superusers, which amounts to the
+same thing. Postgres skips every policy for such a role, so tenant isolation
+is simply not in effect — and nothing looks wrong, because the application
+also filters by `user_id`.
+
+For a single-user local database that is harmless, so the worker logs a
+warning and carries on. In production it refuses to boot. Either way it tells
+you which role it connected as and what is wrong with it.
+
+To fix it anywhere — managed or local — create the unprivileged role and point
+at it:
+
+```bash
+npm run db:setup-role
+```
+
+It needs `POSTGRES_APP_PASSWORD` in `.env` and a `DATABASE_URL` that is
+currently the owner. Afterwards, change `DATABASE_URL` to use `wa_app` with
+that password, keeping the host and database the same. The worker will confirm
+isolation is enforced on its next boot.
+
+(The role itself is created by migration 0001, but without `LOGIN` — the
+migration has no safe way to set a password. This is the step that grants it
+one.)
 
 For Google sign-in, create an OAuth client at
 [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials)
@@ -222,25 +251,37 @@ URI.
 ### Useful commands
 
 ```bash
-npm run typecheck        # every workspace
-npm run build            # production build of the web app
-npm run db:generate      # emit a migration after changing the schema
-npm run db:studio        # browse the database
+npm run typecheck           # every workspace
+npm run build               # production build of the web app
+npm run db:generate         # emit a migration after changing the schema
+npm run db:studio           # browse the database
+npm run db:setup-role       # create the unprivileged role the app connects as
+npm run db:reset-sessions   # unstick a link attempt that went wrong
 
 # Boot a throwaway Postgres and assert the things types cannot prove.
 # No setup, no DATABASE_URL — they bring their own server.
 npm run verify --workspace=@wa/db
+npm run verify:linking --workspace=@wa/worker
 npm run verify:pipeline --workspace=@wa/worker
 ```
 
 ## Deploying for free
 
+**[Full guide: docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** — covering the
+single-VM deployment below, the Vercel variant, and which free database tiers
+survive a worker that never goes idle.
+
+The short version: the worker holds a WhatsApp socket open for hours, so it
+needs a host that stays on. Serverless cannot do it — Vercel's Hobby plan
+terminates a function at 300 seconds, and there is no persistent process to
+hold a socket between invocations. Once you have a machine that stays up, it
+can serve the web app too, which is why one VM is the recommendation.
+
 Oracle Cloud's Always Free tier gives an ARM instance with 2 OCPU and 12 GB of
-RAM that **does not sleep when idle** — the deciding factor, since a campaign
-deliberately pauses 45–90 minutes between batches and a host that suspends on
-inactivity would kill it mid-run. Render's free tier, by comparison, sleeps
-after 15 minutes, has no persistent disk, and deletes its free Postgres after
-30 days.
+RAM that **does not sleep when idle** and does not expire — the deciding
+factor, since a campaign deliberately pauses 45–90 minutes between batches.
+Render's free tier, by comparison, sleeps after 15 minutes, has no persistent
+disk, and offers no free background worker at all.
 
 1. Create an **Ampere A1 (ARM)** instance, Ubuntu 24.04, on the Always Free
    shape. Add your SSH key.
@@ -302,8 +343,9 @@ code that typechecks, behaves correctly in every normal case, and is quietly
 wrong about who can see what.
 
 ```bash
-npm run verify --workspace=@wa/db         # 53 checks: schema, RLS, the raw SQL
-npm run verify:pipeline --workspace=@wa/worker  # 30 checks: the send loop, end to end
+npm run verify --workspace=@wa/db                # schema, RLS, the raw SQL
+npm run verify:linking --workspace=@wa/worker    # the linking handshake
+npm run verify:pipeline --workspace=@wa/worker   # the send loop, end to end
 ```
 
 The first asserts that one account genuinely cannot read, write, update or

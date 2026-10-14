@@ -27,7 +27,7 @@ export const reapStaleClaims: Job = {
   everyMs: 60_000,
 
   async run(ctx) {
-    const cutoff = new Date(Date.now() - STALL_MS);
+    const cutoff = new Date(Date.now() - STALL_MS).toISOString();
 
     return asSystem(ctx.db, async (tx) => {
       // Sends that did land: settle them instead of retrying.

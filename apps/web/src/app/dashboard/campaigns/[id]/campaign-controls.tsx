@@ -12,10 +12,11 @@ import {
 /**
  * Start, pause and cancel.
  *
- * A running campaign refreshes itself every 15 seconds. That is slow enough
- * not to matter on a phone's data plan and fast enough that the counters feel
- * live — and since messages go out at most every 25 seconds, polling faster
- * would show the same numbers again.
+ * The counters stream over SSE in LiveProgress, so this only refreshes slowly
+ * — the recent-activity list and the skip breakdown are rendered on the
+ * server and would otherwise never catch up. A minute is frequent enough for
+ * a list of sends that arrive at most every 25 seconds, and it keeps a phone
+ * from re-fetching the page four times a minute for nothing.
  */
 export function CampaignControls({
   campaignId,
@@ -33,7 +34,7 @@ export function CampaignControls({
 
   useEffect(() => {
     if (status !== 'running') return;
-    const timer = setInterval(() => router.refresh(), 15_000);
+    const timer = setInterval(() => router.refresh(), 60_000);
     return () => clearInterval(timer);
   }, [status, router]);
 
@@ -128,9 +129,8 @@ export function CampaignControls({
       ) : null}
 
       {status === 'running' ? (
-        <p className="hint" aria-live="polite">
-          Updating automatically. You can close this page — sending carries on
-          without it.
+        <p className="hint">
+          You can close this page — sending carries on without it.
         </p>
       ) : null}
     </section>

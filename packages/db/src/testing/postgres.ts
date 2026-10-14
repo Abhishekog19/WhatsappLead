@@ -1,12 +1,14 @@
+import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import postgres from 'postgres';
-import EmbeddedPostgres from 'embedded-postgres';
 
 /**
- * Spins up a throwaway Postgres for verification.
+ * Creates a throwaway Postgres database for verification.
+ * Uses embedded Postgres locally or WA_VERIFY_POSTGRES_URL in CI.
  *
  * Exists because the parts of this system most likely to be wrong are the
  * parts TypeScript cannot check: the hand-written RLS migration, the
@@ -36,10 +38,78 @@ export const APP_ROLE = 'wa_app';
 const APP_PASSWORD = 'verify-only';
 
 export async function startPostgres(): Promise<Harness> {
+  const { ownerUrl, databaseName, stop } = await startCluster();
+
+  try {
+    await configureAppRole(ownerUrl, databaseName);
+  } catch (error) {
+    await stop();
+    throw error;
+  }
+
+  const app = new URL(ownerUrl);
+  app.username = APP_ROLE;
+  app.password = APP_PASSWORD;
+  return { ownerUrl, appUrl: app.toString(), stop };
+}
+
+async function configureAppRole(ownerUrl: string, databaseName: string): Promise<void> {
+  // Mirrors what infra/postgres-init.sh does for a real deployment.
+  const admin = postgres(ownerUrl, { max: 1, prepare: false });
+  try {
+    await admin.unsafe(`
+      do $$
+      begin
+        if not exists (select 1 from pg_roles where rolname = '${APP_ROLE}') then
+          create role ${APP_ROLE} login password '${APP_PASSWORD}' nosuperuser nobypassrls;
+        else
+          alter role ${APP_ROLE} login password '${APP_PASSWORD}' nosuperuser nobypassrls;
+        end if;
+      end
+      $$;
+    `);
+    await admin.unsafe(`grant connect on database "${databaseName}" to ${APP_ROLE}`);
+  } finally {
+    await admin.end({ timeout: 5 });
+  }
+
+}
+
+async function startCluster(): Promise<{ ownerUrl: string; databaseName: string; stop: Harness['stop'] }> {
+  const serviceUrl = process.env.WA_VERIFY_POSTGRES_URL;
+  if (serviceUrl) {
+    // CI supplies a disposable Postgres service. Each suite still owns a fresh
+    // database; migrations and tenant isolation never run against shared data.
+    const databaseName = `wa_verify_${randomUUID().replaceAll('-', '')}`;
+    const cluster = postgres(serviceUrl, { max: 1, prepare: false });
+    try {
+      await cluster.unsafe(`create database "${databaseName}"`);
+    } finally {
+      await cluster.end({ timeout: 5 });
+    }
+
+    const owner = new URL(serviceUrl);
+    owner.pathname = `/${databaseName}`;
+    return {
+      ownerUrl: owner.toString(),
+      databaseName,
+      stop: async () => {
+        const admin = postgres(serviceUrl, { max: 1, prepare: false });
+        try {
+          await admin.unsafe(`drop database "${databaseName}" with (force)`);
+        } finally {
+          await admin.end({ timeout: 5 });
+        }
+      },
+    };
+  }
+
+  const { default: EmbeddedPostgres } = await import('embedded-postgres');
   const dir = mkdtempSync(join(tmpdir(), 'wa-verify-'));
-  // A high fixed port rather than a random one, so a leaked process from a
-  // previous run is obvious instead of silently colliding.
-  const port = 54329;
+  // Asked for from the OS rather than hard-coded. Several suites run back to
+  // back, and a shut-down Postgres does not release its port instantly — a
+  // fixed port made the second suite in a run fail to start, intermittently.
+  const port = await freePort();
 
   const pg = new EmbeddedPostgres({
     databaseDir: dir,
@@ -57,28 +127,9 @@ export async function startPostgres(): Promise<Harness> {
 
   const ownerUrl = `postgres://postgres:postgres@127.0.0.1:${port}/wa`;
 
-  // Mirrors what infra/postgres-init.sh does for a real deployment.
-  const admin = postgres(ownerUrl, { max: 1, prepare: false });
-  try {
-    await admin.unsafe(`
-      do $$
-      begin
-        if not exists (select 1 from pg_roles where rolname = '${APP_ROLE}') then
-          create role ${APP_ROLE} login password '${APP_PASSWORD}' nosuperuser nobypassrls;
-        else
-          alter role ${APP_ROLE} login password '${APP_PASSWORD}' nosuperuser nobypassrls;
-        end if;
-      end
-      $$;
-    `);
-    await admin.unsafe(`grant connect on database wa to ${APP_ROLE}`);
-  } finally {
-    await admin.end({ timeout: 5 });
-  }
-
   return {
     ownerUrl,
-    appUrl: `postgres://${APP_ROLE}:${APP_PASSWORD}@127.0.0.1:${port}/wa`,
+    databaseName: 'wa',
     stop: async () => {
       await pg.stop().catch(() => undefined);
       rmSync(dir, { recursive: true, force: true });
@@ -93,3 +144,19 @@ export async function startPostgres(): Promise<Harness> {
  * relative path to this package's drizzle/ directory.
  */
 export const MIGRATIONS_FOLDER = fileURLToPath(new URL('../../drizzle', import.meta.url));
+
+/** A port the OS says is free right now. */
+async function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.unref();
+    probe.on('error', reject);
+    // Port 0 asks the kernel to allocate; closing immediately leaves a brief
+    // window before Postgres binds it, which is fine for a local test run.
+    probe.listen(0, '127.0.0.1', () => {
+      const address = probe.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      probe.close(() => (port ? resolve(port) : reject(new Error('no free port'))));
+    });
+  });
+}

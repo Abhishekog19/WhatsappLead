@@ -13,6 +13,22 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: verify-only
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      WA_VERIFY_POSTGRES_URL: postgres://postgres:verify-only@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v4
 
@@ -22,8 +38,7 @@ jobs:
           cache: npm
 
       # --ignore-scripts skips the legacy terminal script's Chromium download,
-      # which CI has no use for and which dominates install time. The embedded
-      # Postgres used below ships prebuilt binaries and needs no build step.
+      # which CI has no use for and which dominates install time.
       - name: Install
         run: npm ci --ignore-scripts
 
@@ -35,6 +50,9 @@ jobs:
       # needing them, something has been moved to module scope by mistake.
       - name: Build web
         run: npm run build --workspace=@wa/web
+
+      - name: Verify settings validation
+        run: npm run verify --workspace=@wa/web
 
       # Catches a schema change committed without its migration — the most
       # likely way for production and the code to drift apart.
@@ -57,14 +75,18 @@ jobs:
       # RLS policy silently inert — the application behaved perfectly and
       # isolation was simply gone. Only a check like this one finds that.
       #
-      # The hydrate step is run explicitly rather than by dropping
-      # --ignore-scripts above: it is the one postinstall this job needs, and
-      # naming it keeps every other package's scripts blocked.
-      - name: Prepare embedded Postgres
-        run: node node_modules/@embedded-postgres/linux-x64/scripts/hydrate-symlinks.js
+      # The Linux embedded binary requires ICU 60, absent from modern runners.
+      # Use the disposable service above; the harness creates and drops a fresh
+      # database per suite and still tests a non-superuser application role.
 
       - name: Verify schema and isolation
         run: npm run verify --workspace=@wa/db
+
+      # The linking handshake: three separate bugs here each left the user's
+      # phone on "Logging in…" forever, and none were visible to the type
+      # checker or to any single-step test.
+      - name: Verify linking handshake
+        run: npm run verify:linking --workspace=@wa/worker
 
       # Runs the real send job against a real database with a stubbed WhatsApp
       # socket: dedupe, suppression, the rolling cap, template rendering, and

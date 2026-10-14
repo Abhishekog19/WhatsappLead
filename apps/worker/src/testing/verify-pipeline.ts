@@ -18,7 +18,7 @@ import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import { eq, sql } from 'drizzle-orm';
 import { createDb, asSystem, schema, type Database } from '@wa/db';
 import { MIGRATIONS_FOLDER, startPostgres } from '@wa/db/testing';
-import { createLogger, mapRows } from '@wa/core';
+import { createLogger, mapRows, pickVariant } from '@wa/core';
 import { detectOptOut } from '@wa/wa';
 import { sendCampaigns } from '../jobs/send-campaigns';
 import type { WorkerContext } from '../context';
@@ -340,19 +340,52 @@ async function main(): Promise<void> {
     const first = sent.find((s) => s.phoneE164 === '+917201864189');
     check('placeholders were substituted', Boolean(first && !first.text.includes('{{')), first?.text);
     check(
-      'spreadsheet columns reached the message',
-      Boolean(first?.text.includes('Dental clinic') && first?.text.includes('4.9')),
-      first?.text,
-    );
-    check(
       'spintax was expanded to one option',
       Boolean(first && !first.text.includes('|') && !first.text.includes('{')),
       first?.text,
     );
+    // Only fields present in BOTH variants. Asserting on {{Rating}} made this
+    // flaky: it appears in variant A only, and which variant a contact gets
+    // depends on its id, which is a fresh UUID each run.
+    check(
+      'spreadsheet columns reached the message',
+      Boolean(first?.text.includes('Dental clinic') && first?.text.includes('33')),
+      first?.text,
+    );
+    check(
+      'and the contact name did too',
+      Boolean(first?.text.includes('Ishwar Dental Clinic')),
+      first?.text,
+    );
     if (first) console.log(`       "${first.text}"`);
 
-    const bodies = new Set(sent.map((s) => s.text.slice(0, 20)));
-    check('variants were rotated across recipients', bodies.size > 1, [...bodies]);
+    // Every message has to be a fully rendered instance of one of the two
+    // variants — whichever was chosen, nothing half-substituted.
+    const looksRendered = sent.every(
+      (m) =>
+        !m.text.includes('{') &&
+        !m.text.includes('}') &&
+        (m.text.startsWith('Hi ') || m.text.startsWith('Hello ')),
+    );
+    check('every message rendered cleanly from one variant', looksRendered, sent.map((m) => m.text.slice(0, 24)));
+
+    // Rotation is checked on pickVariant directly rather than on three sends.
+    // Three contacts landing on the same variant by chance is a 1-in-4 event,
+    // which is a flaky test, not a bug.
+    const spread = new Map<string, number>();
+    for (let i = 0; i < 400; i++) {
+      const chosen = pickVariant(['A', 'B'], `seed-${i}`)!;
+      spread.set(chosen, (spread.get(chosen) ?? 0) + 1);
+    }
+    check(
+      'variants are rotated across recipients',
+      spread.size === 2 && [...spread.values()].every((n) => n > 120),
+      Object.fromEntries(spread),
+    );
+    check(
+      'and the same contact always gets the same variant',
+      pickVariant(['A', 'B'], 'stable') === pickVariant(['A', 'B'], 'stable'),
+    );
 
     const persisted = await asSystem(db, async (tx) => {
       const rows = await tx.execute<{ rendered_body: string; wa_message_id: string }>(sql`

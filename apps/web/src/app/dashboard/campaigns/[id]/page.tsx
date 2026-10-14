@@ -21,9 +21,11 @@ import {
   nextWindowOpensAt,
 } from '@wa/core';
 import { settings } from '@wa/db';
+import { workerStatus, type WorkerStatus } from '@wa/db';
 import { queryAsUser } from '@/server/session';
 import { env } from '@/server/context';
 import { CampaignControls } from './campaign-controls';
+import { LiveProgress } from './live-progress';
 
 export const metadata: Metadata = { title: 'Campaign' };
 
@@ -69,7 +71,7 @@ export default async function CampaignPage({
     const row = rows[0];
     if (!row) return null;
 
-    const [recent, skipBreakdown, prefs, usedRows] = await Promise.all([
+    const [recent, skipBreakdown, prefs, worker, usedRows] = await Promise.all([
       tx
         .select({
           targetId: campaignTargets.id,
@@ -118,11 +120,19 @@ export default async function CampaignPage({
         .where(eq(settings.userId, userId))
         .limit(1),
 
+      // Whether a worker is alive at all. Without this the page cannot tell a
+      // campaign that is pacing itself from one whose sender is not running.
+      workerStatus(tx),
+
+      // ISO string with an explicit cast, not a Date object. drizzle hands
+      // raw-SQL parameters to postgres-js untyped, and a Date arrives there as
+      // something it will not serialise — "the string argument must be of type
+      // string… received an instance of Date", thrown at render time.
       tx.execute<{ n: number }>(sql`
         select count(*)::int as n
           from new_contact_sends
          where session_id = ${row.sessionId}
-           and sent_at > ${new Date(Date.now() - ROLLING_WINDOW_MS)}
+           and sent_at > ${new Date(Date.now() - ROLLING_WINDOW_MS).toISOString()}::timestamptz
       `),
     ]);
 
@@ -132,15 +142,19 @@ export default async function CampaignPage({
       skipBreakdown,
       prefs: prefs[0] ?? null,
       used: Number(usedRows[0]?.n ?? 0),
+      worker,
     };
   });
 
   if (!data) notFound();
 
   const c = data.campaign;
-  const done = c.sentCount + c.failedCount + c.skippedCount;
-  const pct = c.totalTargets > 0 ? Math.round((done / c.totalTargets) * 100) : 0;
-  const remaining = Math.max(0, c.totalTargets - done);
+  // The progress figures live in LiveProgress now; this is only needed for
+  // the controls, which ask how many messages a cancel would drop.
+  const remaining = Math.max(
+    0,
+    c.totalTargets - (c.sentCount + c.failedCount + c.skippedCount),
+  );
 
   const window = data.prefs
     ? {
@@ -168,6 +182,7 @@ export default async function CampaignPage({
       : null;
 
   const explanation = explainQuiet({
+    worker: data.worker,
     status: c.status,
     sessionStatus: data.sessionStatus,
     throttledUntil: data.throttledUntil,
@@ -190,36 +205,26 @@ export default async function CampaignPage({
         </p>
       </div>
 
-      <section className="card">
-        <div className="flex items-baseline justify-between gap-3">
-          <p className="text-sm text-neutral-600 dark:text-neutral-400">Progress</p>
-          <p className="text-sm font-semibold tabular-nums">{pct}%</p>
-        </div>
-        <div
-          role="progressbar"
-          aria-valuenow={done}
-          aria-valuemin={0}
-          aria-valuemax={c.totalTargets}
-          aria-label="Campaign progress"
-          className="mt-2 h-2.5 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800"
-        >
-          <div
-            className="h-full rounded-full bg-brand-500 transition-[width]"
-            style={{ width: `${pct}%` }}
-          />
-        </div>
-
-        <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
-          <Figure label="Sent" value={c.sentCount} />
-          <Figure label="Replies" value={c.replyCount} />
-          <Figure label="Remaining" value={remaining} />
-          <Figure label="Skipped" value={c.skippedCount} />
-          {c.failedCount > 0 ? <Figure label="Failed" value={c.failedCount} /> : null}
-          {cap !== null ? (
-            <Figure label="Today's quota" text={`${data.used} / ${cap}`} />
-          ) : null}
-        </dl>
-      </section>
+      <LiveProgress
+        campaignId={c.id}
+        capLabel={cap !== null ? `${data.used} / ${cap}` : null}
+        initial={{
+          status: c.status,
+          totalTargets: c.totalTargets,
+          sentCount: c.sentCount,
+          failedCount: c.failedCount,
+          skippedCount: c.skippedCount,
+          replyCount: c.replyCount,
+          pauseReason: c.pauseReason,
+          latest: data.recent
+            .filter((t) => t.status === 'sent' && t.sentAt)
+            .map((t) => ({
+              name: t.contactName,
+              phoneE164: t.contactPhone,
+              sentAt: t.sentAt!.toISOString(),
+            }))[0] ?? null,
+        }}
+      />
 
       {explanation ? (
         <div
@@ -331,6 +336,7 @@ export default async function CampaignPage({
  * the sending window, which beats the daily quota.
  */
 function explainQuiet(input: {
+  worker: WorkerStatus;
   status: string;
   sessionStatus: string | null;
   throttledUntil: Date | null;
@@ -344,7 +350,8 @@ function explainQuiet(input: {
   cap: number | null;
   remaining: number;
 }): { text: string; tone: 'info' | 'warn' } | null {
-  const { status, sessionStatus, throttledUntil, window, used, cap, remaining } = input;
+  const { worker, status, sessionStatus, throttledUntil, window, used, cap, remaining } =
+    input;
 
   if (status === 'draft') {
     return {
@@ -360,6 +367,17 @@ function explainQuiet(input: {
   }
   if (status === 'paused') return null; // The pause reason is shown by the controls.
   if (status !== 'running') return null;
+
+  // Checked before anything else, because none of the explanations below can
+  // be true if there is no process to act on them.
+  if (!worker.alive) {
+    return {
+      text: worker.lastSeenAt
+        ? `The sender is not running — it was last seen ${worker.lastSeenAt.toLocaleString()}. This campaign stays exactly where it is and resumes when the worker starts again. Run "npm run dev:worker".`
+        : 'The sender has never started. Nothing will be sent until it does: run "npm run dev:worker" alongside the web app.',
+      tone: 'warn',
+    };
+  }
 
   if (sessionStatus === 'logged_out' || sessionStatus === 'banned') {
     return {
@@ -402,24 +420,6 @@ function explainQuiet(input: {
   };
 }
 
-function Figure({
-  label,
-  value,
-  text,
-}: {
-  label: string;
-  value?: number;
-  text?: string;
-}) {
-  return (
-    <div>
-      <dt className="text-xs text-neutral-500">{label}</dt>
-      <dd className="mt-0.5 text-lg font-bold tabular-nums">
-        {text ?? (value ?? 0).toLocaleString()}
-      </dd>
-    </div>
-  );
-}
 
 const SKIP_LABEL: Record<string, string> = {
   duplicate: 'Already messaged',

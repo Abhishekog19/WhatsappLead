@@ -19,13 +19,19 @@ FROM base AS deps
 COPY package.json package-lock.json ./
 COPY packages/core/package.json packages/core/
 COPY packages/db/package.json packages/db/
+# Needed even though the web app never imports it: the lockfile knows about
+# the workspace, and without its manifest npm leaves a dangling link behind.
+COPY packages/wa/package.json packages/wa/
 COPY apps/web/package.json apps/web/
 COPY apps/worker/package.json apps/worker/
 
 # --ignore-scripts: the root still carries the legacy terminal script's
 # puppeteer dependency, whose postinstall would pull a ~200 MB Chromium that
 # nothing in this image uses.
-RUN npm ci --ignore-scripts --omit=optional
+# Scoped to the web app. Installing every workspace would drag in the
+# WhatsApp engine's dependencies — baileys and its protobuf stack — which only
+# the worker runs, for no benefit beyond a larger image to push and pull.
+RUN npm ci --ignore-scripts --omit=optional --workspace=@wa/web --include-workspace-root
 
 
 # ---------- build -------------------------------------------------------------

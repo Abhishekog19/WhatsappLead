@@ -73,7 +73,8 @@ export class WaManager {
   async startLinking(session: {
     id: string;
     userId: string;
-    phoneE164: string;
+    /** E.164 for a pairing code; null to wait for a QR scan instead. */
+    phoneE164: string | null;
   }): Promise<WaConnection> {
     // A half-open socket from a previous attempt would race the new one for
     // the same registration, so replace rather than reuse.
