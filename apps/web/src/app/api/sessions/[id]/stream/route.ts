@@ -1,6 +1,7 @@
 import QRCode from 'qrcode';
 import { and, eq, isNull, waSessions } from '@wa/db';
 import { queryAsUser } from '@/server/session';
+import { SSE_HEARTBEAT_MS, SSE_MAX_DURATION_MS } from '@/server/sse';
 
 /**
  * Live session status, as Server-Sent Events.
@@ -18,8 +19,6 @@ import { queryAsUser } from '@/server/session';
 
 const POLL_MS = 1_500;
 /** Pairing cannot take this long; a hung tab must not hold a connection open. */
-const MAX_DURATION_MS = 10 * 60 * 1_000;
-const HEARTBEAT_MS = 20_000;
 
 export const dynamic = 'force-dynamic';
 
@@ -124,9 +123,9 @@ export async function GET(
             finish();
           }
         }
-      }, HEARTBEAT_MS);
+      }, SSE_HEARTBEAT_MS);
 
-      deadline = setTimeout(finish, MAX_DURATION_MS);
+      deadline = setTimeout(finish, SSE_MAX_DURATION_MS);
     },
 
     cancel() {

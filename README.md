@@ -267,12 +267,21 @@ npm run verify:pipeline --workspace=@wa/worker
 
 ## Deploying for free
 
+**[Full guide: docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** — covering the
+single-VM deployment below, the Vercel variant, and which free database tiers
+survive a worker that never goes idle.
+
+The short version: the worker holds a WhatsApp socket open for hours, so it
+needs a host that stays on. Serverless cannot do it — Vercel's Hobby plan
+terminates a function at 300 seconds, and there is no persistent process to
+hold a socket between invocations. Once you have a machine that stays up, it
+can serve the web app too, which is why one VM is the recommendation.
+
 Oracle Cloud's Always Free tier gives an ARM instance with 2 OCPU and 12 GB of
-RAM that **does not sleep when idle** — the deciding factor, since a campaign
-deliberately pauses 45–90 minutes between batches and a host that suspends on
-inactivity would kill it mid-run. Render's free tier, by comparison, sleeps
-after 15 minutes, has no persistent disk, and deletes its free Postgres after
-30 days.
+RAM that **does not sleep when idle** and does not expire — the deciding
+factor, since a campaign deliberately pauses 45–90 minutes between batches.
+Render's free tier, by comparison, sleeps after 15 minutes, has no persistent
+disk, and offers no free background worker at all.
 
 1. Create an **Ampere A1 (ARM)** instance, Ubuntu 24.04, on the Always Free
    shape. Add your SSH key.
