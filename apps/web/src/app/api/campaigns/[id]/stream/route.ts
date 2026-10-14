@@ -1,4 +1,4 @@
-import { and, campaigns, campaignTargets, contacts, desc, eq, sql } from '@wa/db';
+import { and, campaigns, campaignTargets, contacts, eq, sql } from '@wa/db';
 import { queryAsUser } from '@/server/session';
 
 /**
@@ -167,7 +167,11 @@ async function read(campaignId: string): Promise<Snapshot | null> {
           eq(campaignTargets.status, 'sent'),
         ),
       )
-      .orderBy(desc(sql`${campaignTargets.sentAt} nulls last`))
+      // Written as one fragment, not desc(sql`… nulls last`): wrapping it
+      // produces "order by sent_at nulls last desc", which Postgres rejects.
+      // The stream's first read then threw, the route 500'd, and the page sat
+      // on "reconnecting" with no clue why.
+      .orderBy(sql`${campaignTargets.sentAt} desc nulls last`)
       .limit(1);
 
     const top = latest[0];

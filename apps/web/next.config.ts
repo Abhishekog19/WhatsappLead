@@ -16,6 +16,19 @@ const config: NextConfig = {
   reactStrictMode: true,
 
   /**
+   * Where the build output goes, overridable so a verification build cannot
+   * clobber a running dev server.
+   *
+   * `next build` and `next dev` share .next, and they do not share a format:
+   * building while the dev server is up replaces its state with a production
+   * bundle, and every route then returns a bare "Internal Server Error" with
+   * nothing in the logs to explain it. Typechecking and building are things
+   * worth doing while the app is running, so they get their own directory
+   * instead — see the verify:build script.
+   */
+  distDir: process.env.NEXT_BUILD_DIR || '.next',
+
+  /**
    * The workspace packages ship TypeScript source rather than compiled output,
    * so Next has to run them through its own compiler.
    */

@@ -15,6 +15,7 @@ import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import { eq, sql } from 'drizzle-orm';
 import { createDb } from '../client';
 import { checkTenantIsolation } from '../isolation';
+import { workerStatus } from '../worker-status';
 import { asSystem, withUser } from '../tenant';
 import * as schema from '../schema';
 import { startPostgres } from './postgres';
@@ -59,7 +60,32 @@ async function main(): Promise<void> {
        where table_schema = 'public' and table_type = 'BASE TABLE'
     `);
     // drizzle's own bookkeeping table lives in the `drizzle` schema, not here.
-    check('18 tables created', Number(tables[0]?.n) === 18, tables[0]);
+    check('19 tables created', Number(tables[0]?.n) === 19, tables[0]);
+
+    // worker_heartbeats is deliberately NOT a tenant table: it is
+    // infrastructure, holds no personal data, and every account depends on the
+    // same workers. Asserted so that "it has no RLS" stays a decision rather
+    // than becoming an oversight someone finds later.
+    const heartbeatTable = await owner.db.execute<{
+      rls: boolean;
+      has_user_id: boolean;
+    }>(sql`
+      select c.relrowsecurity as rls,
+             exists (
+               select 1 from information_schema.columns
+                where table_schema = 'public'
+                  and table_name = 'worker_heartbeats'
+                  and column_name = 'user_id'
+             ) as has_user_id
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = 'public' and c.relname = 'worker_heartbeats'
+    `);
+    check(
+      'worker_heartbeats carries no tenant column and no RLS, by design',
+      heartbeatTable[0]?.rls === false && heartbeatTable[0]?.has_user_id === false,
+      heartbeatTable[0],
+    );
 
     const forced = await owner.db.execute<{ relname: string }>(sql`
       select c.relname from pg_class c
@@ -281,6 +307,46 @@ async function main(): Promise<void> {
     } finally {
       await memberDb.sql.end({ timeout: 5 }).catch(() => undefined);
     }
+
+    // -----------------------------------------------------------------------
+    section('Worker liveness');
+
+    const noWorker = await workerStatus(owner.db);
+    check(
+      'with no heartbeat at all, no worker is reported alive',
+      noWorker.alive === false && noWorker.lastSeenAt === null,
+      noWorker,
+    );
+
+    await owner.db.execute(sql`
+      insert into worker_heartbeats (worker_id, last_seen_at, open_sessions)
+      values ('fresh', now(), 2)
+    `);
+    const live = await workerStatus(owner.db);
+    check(
+      'a recent heartbeat reports alive, with its socket count',
+      live.alive && live.liveWorkers === 1 && live.openSessions === 2,
+      live,
+    );
+
+    // The window matters: too short and a worker busy with a slow job looks
+    // dead, too long and someone who forgot to start it waits for the news.
+    await owner.db.execute(sql`
+      update worker_heartbeats
+         set last_seen_at = now() - interval '90 seconds' where worker_id = 'fresh'
+    `);
+    const stale = await workerStatus(owner.db);
+    check(
+      'a heartbeat older than the window is not trusted',
+      stale.alive === false && stale.lastSeenAt !== null,
+      stale,
+    );
+    check(
+      'but the last-seen time is still reported, so the UI can say when',
+      stale.lastSeenAt instanceof Date,
+    );
+
+    await owner.db.execute(sql`delete from worker_heartbeats`);
 
     // -----------------------------------------------------------------------
     section('Column qualification in raw SQL');

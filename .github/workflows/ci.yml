@@ -36,6 +36,9 @@ jobs:
       - name: Build web
         run: npm run build --workspace=@wa/web
 
+      - name: Verify settings validation
+        run: npm run verify --workspace=@wa/web
+
       # Catches a schema change committed without its migration — the most
       # likely way for production and the code to drift apart.
       - name: Check migrations are up to date

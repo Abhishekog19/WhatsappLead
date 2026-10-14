@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { and, count, eq, sql, waSessions, campaigns, contacts } from '@wa/db';
 import { effectiveCap, ROLLING_WINDOW_MS, type AccountType, type Tier } from '@wa/core';
+import { workerStatus } from '@wa/db';
 import { queryAsUser } from '@/server/session';
 import { env } from '@/server/context';
 
@@ -60,7 +61,10 @@ export default async function DashboardPage() {
       usedBySession[r.session_id] = r.n;
     }
 
+    const worker = await workerStatus(tx);
+
     return {
+      worker,
       sessions,
       activeCampaigns,
       contactCount: contactCount[0]?.n ?? 0,
@@ -74,6 +78,24 @@ export default async function DashboardPage() {
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-bold tracking-tight">Home</h1>
+
+      {!data.worker.alive ? (
+        <div className="card border-amber-300 bg-amber-50 dark:border-amber-900 dark:bg-amber-950">
+          <p className="font-semibold text-amber-900 dark:text-amber-100">
+            The sender is not running
+          </p>
+          <p className="mt-1 text-sm text-amber-800 dark:text-amber-200">
+            Nothing is being sent, and a running campaign stays exactly where it
+            is until it starts again.{' '}
+            {data.worker.lastSeenAt
+              ? `Last seen ${data.worker.lastSeenAt.toLocaleString()}.`
+              : 'It has never started.'}
+          </p>
+          <p className="mt-2 font-mono text-xs text-amber-800 dark:text-amber-200">
+            npm run dev:worker
+          </p>
+        </div>
+      ) : null}
 
       {data.sessions.length === 0 ? (
         <EmptyState />

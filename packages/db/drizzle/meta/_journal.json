@@ -22,6 +22,13 @@
       "when": 1791545444066,
       "tag": "0002_link_method",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791944278281,
+      "tag": "0003_worker_heartbeats",
+      "breakpoints": true
     }
   ]
 }

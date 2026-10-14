@@ -21,6 +21,7 @@ import {
   nextWindowOpensAt,
 } from '@wa/core';
 import { settings } from '@wa/db';
+import { workerStatus, type WorkerStatus } from '@wa/db';
 import { queryAsUser } from '@/server/session';
 import { env } from '@/server/context';
 import { CampaignControls } from './campaign-controls';
@@ -70,7 +71,7 @@ export default async function CampaignPage({
     const row = rows[0];
     if (!row) return null;
 
-    const [recent, skipBreakdown, prefs, usedRows] = await Promise.all([
+    const [recent, skipBreakdown, prefs, worker, usedRows] = await Promise.all([
       tx
         .select({
           targetId: campaignTargets.id,
@@ -119,6 +120,10 @@ export default async function CampaignPage({
         .where(eq(settings.userId, userId))
         .limit(1),
 
+      // Whether a worker is alive at all. Without this the page cannot tell a
+      // campaign that is pacing itself from one whose sender is not running.
+      workerStatus(tx),
+
       // ISO string with an explicit cast, not a Date object. drizzle hands
       // raw-SQL parameters to postgres-js untyped, and a Date arrives there as
       // something it will not serialise — "the string argument must be of type
@@ -137,6 +142,7 @@ export default async function CampaignPage({
       skipBreakdown,
       prefs: prefs[0] ?? null,
       used: Number(usedRows[0]?.n ?? 0),
+      worker,
     };
   });
 
@@ -176,6 +182,7 @@ export default async function CampaignPage({
       : null;
 
   const explanation = explainQuiet({
+    worker: data.worker,
     status: c.status,
     sessionStatus: data.sessionStatus,
     throttledUntil: data.throttledUntil,
@@ -329,6 +336,7 @@ export default async function CampaignPage({
  * the sending window, which beats the daily quota.
  */
 function explainQuiet(input: {
+  worker: WorkerStatus;
   status: string;
   sessionStatus: string | null;
   throttledUntil: Date | null;
@@ -342,7 +350,8 @@ function explainQuiet(input: {
   cap: number | null;
   remaining: number;
 }): { text: string; tone: 'info' | 'warn' } | null {
-  const { status, sessionStatus, throttledUntil, window, used, cap, remaining } = input;
+  const { worker, status, sessionStatus, throttledUntil, window, used, cap, remaining } =
+    input;
 
   if (status === 'draft') {
     return {
@@ -358,6 +367,17 @@ function explainQuiet(input: {
   }
   if (status === 'paused') return null; // The pause reason is shown by the controls.
   if (status !== 'running') return null;
+
+  // Checked before anything else, because none of the explanations below can
+  // be true if there is no process to act on them.
+  if (!worker.alive) {
+    return {
+      text: worker.lastSeenAt
+        ? `The sender is not running — it was last seen ${worker.lastSeenAt.toLocaleString()}. This campaign stays exactly where it is and resumes when the worker starts again. Run "npm run dev:worker".`
+        : 'The sender has never started. Nothing will be sent until it does: run "npm run dev:worker" alongside the web app.',
+      tone: 'warn',
+    };
+  }
 
   if (sessionStatus === 'logged_out' || sessionStatus === 'banned') {
     return {

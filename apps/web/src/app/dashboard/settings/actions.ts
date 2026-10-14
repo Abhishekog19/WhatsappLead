@@ -1,44 +1,16 @@
 'use server';
 
 import { revalidatePath } from 'next/cache';
-import { z } from 'zod';
 import { auditLog, eq, settings } from '@wa/db';
 import { queryAsUser } from '@/server/session';
+import { parseSettingsForm } from './schema';
 
 /**
  * Settings mutations.
  *
- * Everything here changes how fast the user's number sends, so the bounds are
- * enforced server-side rather than trusted from the form. The upper bounds are
- * not arbitrary: a 5-second gap between messages is a bot signature, and a cap
- * above the platform ceiling would be silently clamped anyway.
+ * The validation lives in ./schema.ts so it can be tested on its own; this is
+ * only the part that needs a session and a database.
  */
-
-const schema = z
-  .object({
-    dedupeMode: z.enum(['never_repeat', 'cooldown', 'off']),
-    cooldownDays: z.coerce.number().int().min(1).max(3650),
-    newContactCap24h: z
-      .union([z.coerce.number().int().min(1).max(500), z.literal('')])
-      .transform((v) => (v === '' ? null : v)),
-    warmupEnabled: z.coerce.boolean(),
-    minDelayMs: z.coerce.number().int().min(10_000).max(600_000),
-    maxDelayMs: z.coerce.number().int().min(10_000).max(1_800_000),
-    batchSize: z.coerce.number().int().min(1).max(100),
-    sendWindowStartHour: z.coerce.number().int().min(0).max(23),
-    sendWindowEndHour: z.coerce.number().int().min(1).max(24),
-    skipWeekends: z.coerce.boolean(),
-    timezone: z.string().min(1).max(64),
-    defaultCountry: z.string().length(2).toUpperCase(),
-  })
-  .refine((v) => v.maxDelayMs >= v.minDelayMs, {
-    path: ['maxDelayMs'],
-    message: 'Maximum delay must be at least the minimum delay.',
-  })
-  .refine((v) => v.sendWindowEndHour > v.sendWindowStartHour, {
-    path: ['sendWindowEndHour'],
-    message: 'The send window must end after it starts.',
-  });
 
 export interface SaveResult {
   ok: boolean;
@@ -50,39 +22,27 @@ export async function saveSettings(
   _prev: SaveResult | null,
   formData: FormData,
 ): Promise<SaveResult> {
-  const raw = {
-    dedupeMode: formData.get('dedupeMode'),
-    cooldownDays: formData.get('cooldownDays'),
-    newContactCap24h: formData.get('newContactCap24h') ?? '',
-    // Unchecked checkboxes are absent from FormData entirely.
-    warmupEnabled: formData.get('warmupEnabled') === 'on',
-    minDelayMs: Number(formData.get('minDelaySeconds') ?? 0) * 1000,
-    maxDelayMs: Number(formData.get('maxDelaySeconds') ?? 0) * 1000,
-    batchSize: formData.get('batchSize'),
-    sendWindowStartHour: formData.get('sendWindowStartHour'),
-    sendWindowEndHour: formData.get('sendWindowEndHour'),
-    skipWeekends: formData.get('skipWeekends') === 'on',
-    timezone: formData.get('timezone'),
-    defaultCountry: formData.get('defaultCountry'),
-  };
-
-  const parsed = schema.safeParse(raw);
-  if (!parsed.success) {
-    const fieldErrors: Record<string, string> = {};
-    for (const issue of parsed.error.issues) {
-      const key = String(issue.path[0] ?? '');
-      if (key && !fieldErrors[key]) fieldErrors[key] = issue.message;
-    }
-    return { ok: false, message: 'Some values need fixing.', fieldErrors };
+  const parsed = parseSettingsForm(formData);
+  if (!parsed.ok) {
+    return { ok: false, message: parsed.message, fieldErrors: parsed.fieldErrors };
   }
 
-  const v = parsed.data;
+  const v = parsed.value;
 
-  await queryAsUser(async (tx, userId) => {
-    await tx
+  const saved = await queryAsUser(async (tx, userId) => {
+    // returning() rather than a bare update: a zero-row update means the
+    // settings row is missing, and reporting "saved" in that case is how a
+    // form appears to silently revert.
+    const rows = await tx
       .update(settings)
       .set({ ...v, updatedAt: new Date() })
-      .where(eq(settings.userId, userId));
+      .where(eq(settings.userId, userId))
+      .returning({
+        startHour: settings.sendWindowStartHour,
+        endHour: settings.sendWindowEndHour,
+      });
+
+    if (!rows[0]) return null;
 
     await tx.insert(auditLog).values({
       userId,
@@ -97,10 +57,35 @@ export async function saveSettings(
         warmupEnabled: v.warmupEnabled,
         minDelayMs: v.minDelayMs,
         maxDelayMs: v.maxDelayMs,
+        sendWindowStartHour: v.sendWindowStartHour,
+        sendWindowEndHour: v.sendWindowEndHour,
       },
     });
+
+    return rows[0];
   });
 
+  if (!saved) {
+    return {
+      ok: false,
+      message: 'Your settings row is missing. Reload the page and try again.',
+    };
+  }
+
   revalidatePath('/dashboard/settings');
-  return { ok: true, message: 'Settings saved.' };
+  revalidatePath('/dashboard');
+
+  // Echo the hours back. The form has no way to tell a successful save from a
+  // rejected one otherwise, which is exactly how this looked like a revert.
+  return {
+    ok: true,
+    message: `Saved. Sending between ${formatHour(saved.startHour)} and ${formatHour(saved.endHour)}.`,
+  };
+}
+
+function formatHour(h: number): string {
+  if (h === 0) return 'midnight';
+  if (h === 12) return 'noon';
+  if (h === 24) return 'midnight';
+  return h < 12 ? `${h} am` : `${h - 12} pm`;
 }

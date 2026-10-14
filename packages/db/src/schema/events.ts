@@ -1,5 +1,6 @@
 import {
   index,
+  integer,
   jsonb,
   pgTable,
   smallint,
@@ -160,3 +161,24 @@ export const auditLog = pgTable(
   },
   (t) => [index('audit_log_user_idx').on(t.userId, t.occurredAt)],
 );
+
+/**
+ * Proof that a worker is alive.
+ *
+ * The web app cannot otherwise tell a campaign that is pacing itself from one
+ * whose sender is not running. Both look identical: status 'running', targets
+ * queued, nothing happening. The campaign page confidently explained that
+ * messages go out every 25-55 seconds while no worker process existed at all.
+ *
+ * One row per process, upserted on a short interval. Deliberately not a tenant
+ * table — it is infrastructure, holds no personal data, and every user's
+ * campaigns depend on the same workers.
+ */
+export const workerHeartbeats = pgTable('worker_heartbeats', {
+  /** Host and pid, as the worker reports itself in its logs. */
+  workerId: text('worker_id').primaryKey(),
+  startedAt: timestamp('started_at', { withTimezone: true }).defaultNow().notNull(),
+  lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).defaultNow().notNull(),
+  /** Sockets this process is holding, for the dashboard. */
+  openSessions: integer('open_sessions').notNull().default(0),
+});

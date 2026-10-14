@@ -3,6 +3,7 @@ import { createContext } from './context';
 import { startHealthServer } from './health';
 import { Scheduler } from './scheduler';
 import { expirePairingArtifacts } from './jobs/expire-pairing-artifacts';
+import { heartbeat } from './jobs/heartbeat';
 import { maintainSessions } from './jobs/maintain-sessions';
 import { reapStaleClaims } from './jobs/reap-stale-claims';
 import { sendCampaigns } from './jobs/send-campaigns';
@@ -70,6 +71,9 @@ async function main(): Promise<void> {
   }
 
   const scheduler = new Scheduler(ctx, [
+    // First, so the web app learns this process exists before anything slow
+    // runs — otherwise a freshly started worker looks dead for a tick or two.
+    heartbeat,
     // Order is deliberate: sockets are brought up before the sender looks for
     // work, so a freshly resumed session is usable on the same tick.
     maintainSessions,
