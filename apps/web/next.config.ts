@@ -24,7 +24,9 @@ const config: NextConfig = {
    * bundle, and every route then returns a bare "Internal Server Error" with
    * nothing in the logs to explain it. Typechecking and building are things
    * worth doing while the app is running, so they get their own directory
-   * instead — see the verify:build script.
+   * instead — see the verify:build script. Use .next-verify for anything
+   * ad-hoc too: Next appends each new distDir to tsconfig's include, so a
+   * one-off name leaves a stale entry behind.
    */
   distDir: process.env.NEXT_BUILD_DIR || '.next',
 
