@@ -18,8 +18,10 @@ import {
   settings,
   sql,
 } from '@wa/db';
-import { queryAsUser } from '@/server/session';
+import { requireUser, queryAsUser } from '@/server/session';
 import { decodeSpreadsheet, ImportFileError } from '@/server/spreadsheet';
+import { ImportBusyError, withImportSlot } from '@/server/import-limit';
+import { env } from '@/server/context';
 
 /**
  * Spreadsheet import, in two steps.
@@ -53,7 +55,7 @@ export interface PreviewResult {
   };
 }
 
-export async function previewImport(
+async function previewImportImpl(
   _prev: PreviewResult | null,
   formData: FormData,
 ): Promise<PreviewResult> {
@@ -61,10 +63,14 @@ export async function previewImport(
   if (!(file instanceof File) || file.size === 0) {
     return { ok: false, message: 'Choose a file to upload.' };
   }
-  if (file.size > MAX_UPLOAD_BYTES) {
+  const limitBytes = env().MAX_UPLOAD_MB * 1024 * 1024;
+  if (file.size > limitBytes) {
     return {
       ok: false,
-      message: `That file is ${(file.size / 1024 / 1024).toFixed(1)} MB. The limit is ${MAX_UPLOAD_BYTES / 1024 / 1024} MB.`,
+      message:
+        `That file is ${(file.size / 1024 / 1024).toFixed(1)} MB, and the limit is ` +
+        `${env().MAX_UPLOAD_MB} MB. Split it, or save it as .csv — the same rows ` +
+        `take a fraction of the space.`,
     };
   }
 
@@ -72,6 +78,7 @@ export async function previewImport(
   try {
     decoded = await decodeSpreadsheet(file);
   } catch (err) {
+    if (err instanceof ImportBusyError) return { ok: false, message: err.message };
     if (err instanceof ImportFileError) return { ok: false, message: err.message };
     throw err;
   }
@@ -142,7 +149,7 @@ const commitSchema = z.object({
   ignore: z.array(z.string()),
 });
 
-export async function commitImport(
+async function commitImportImpl(
   _prev: CommitResult | null,
   formData: FormData,
 ): Promise<CommitResult> {
@@ -166,6 +173,7 @@ export async function commitImport(
   try {
     decoded = await decodeSpreadsheet(file);
   } catch (err) {
+    if (err instanceof ImportBusyError) return { ok: false, message: err.message };
     if (err instanceof ImportFileError) return { ok: false, message: err.message };
     throw err;
   }
@@ -324,4 +332,22 @@ function suggestListName(filename: string): string {
   const base = filename.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
   if (!base) return 'Imported list';
   return base.charAt(0).toUpperCase() + base.slice(1, 80);
+}
+
+export async function previewImport(prev: PreviewResult | null, formData: FormData): Promise<PreviewResult> {
+  await requireUser();
+  try { return await withImportSlot(() => previewImportImpl(prev, formData)); }
+  catch (error) {
+    if (error instanceof ImportBusyError) return { ok: false, message: error.message };
+    throw error;
+  }
+}
+
+export async function commitImport(prev: CommitResult | null, formData: FormData): Promise<CommitResult> {
+  await requireUser();
+  try { return await withImportSlot(() => commitImportImpl(prev, formData)); }
+  catch (error) {
+    if (error instanceof ImportBusyError) return { ok: false, message: error.message };
+    throw error;
+  }
 }

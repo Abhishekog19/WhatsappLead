@@ -19,8 +19,9 @@ export function database(): Database {
     const e = env();
     cachedDb = getDb(e.DATABASE_URL, {
       // The web tier runs short request-scoped queries; the worker gets its own
-      // pool so a long send cannot starve page loads.
-      maxConnections: 8,
+      // pool so a long send cannot starve page loads. Small and configurable:
+      // both processes share one 512 MB container and one database pooler.
+      maxConnections: e.WEB_DB_POOL,
       debug: e.LOG_LEVEL === 'debug',
     });
   }

@@ -1,5 +1,6 @@
 import ExcelJS from 'exceljs';
-import { MAX_IMPORT_ROWS } from '@wa/core';
+import { loadEnv } from '@wa/core';
+import { checkWorkbookBudget, checkCsvBudget } from './upload-budget';
 
 /**
  * Spreadsheet decoding.
@@ -28,6 +29,9 @@ export async function decodeSpreadsheet(
   file: File,
 ): Promise<DecodedSheet> {
   const name = file.name.toLowerCase();
+  if (file.size > loadEnv().MAX_UPLOAD_MB * 1024 * 1024) {
+    throw new ImportFileError('File exceeds the upload size limit. Split it into smaller files.');
+  }
   const buffer = await file.arrayBuffer();
 
   if (name.endsWith('.csv')) return decodeCsv(buffer);
@@ -41,6 +45,7 @@ export async function decodeSpreadsheet(
 async function decodeXlsx(buffer: ArrayBuffer): Promise<DecodedSheet> {
   const workbook = new ExcelJS.Workbook();
   try {
+    checkWorkbookBudget(Buffer.from(buffer), loadEnv().MAX_IMPORT_ROWS);
     await workbook.xlsx.load(buffer);
   } catch {
     throw new ImportFileError(
@@ -57,6 +62,7 @@ async function decodeXlsx(buffer: ArrayBuffer): Promise<DecodedSheet> {
 async function decodeCsv(buffer: ArrayBuffer): Promise<DecodedSheet> {
   const workbook = new ExcelJS.Workbook();
   try {
+    checkCsvBudget(Buffer.from(buffer).toString('utf8'), loadEnv().MAX_IMPORT_ROWS);
     // ExcelJS' CSV reader wants a stream; a one-chunk readable is enough and
     // avoids writing the upload to a temporary file.
     const { Readable } = await import('node:stream');
@@ -73,6 +79,8 @@ async function decodeCsv(buffer: ArrayBuffer): Promise<DecodedSheet> {
 }
 
 function extract(sheet: ExcelJS.Worksheet): DecodedSheet {
+  // Read once rather than per row.
+  const maxRows = loadEnv().MAX_IMPORT_ROWS;
   const headerRow = sheet.getRow(1);
   const headers: string[] = [];
   const seen = new Map<string, number>();
@@ -99,7 +107,7 @@ function extract(sheet: ExcelJS.Worksheet): DecodedSheet {
 
   sheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
     if (rowNumber === 1) return;
-    if (rows.length >= MAX_IMPORT_ROWS) {
+    if (rows.length >= maxRows) {
       truncated = true;
       return;
     }
