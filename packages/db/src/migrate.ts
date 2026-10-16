@@ -13,7 +13,7 @@ import { createDb } from './client';
 async function main(): Promise<void> {
   loadEnvFile();
 
-  const url = process.env.DATABASE_URL;
+  const url = process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL;
   if (!url) {
     console.error(
       'DATABASE_URL is not set.\n' +

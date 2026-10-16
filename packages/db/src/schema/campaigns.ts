@@ -46,6 +46,20 @@ export const campaigns = pgTable(
     pausedAt: timestamp('paused_at', { withTimezone: true }),
     pauseReason: text('pause_reason'),
 
+    /**
+     * Earliest moment the next message may go out, and how far into the
+     * current batch we are.
+     *
+     * Persisted rather than held in memory because the host restarts often —
+     * a free instance spins down after fifteen idle minutes and may be
+     * recycled at any time. An in-memory pacer reset on every restart, which
+     * meant a restart skipped the inter-message delay and, worse, the
+     * 45-90 minute batch pause. The pacing exists to look human; a limit that
+     * a restart bypasses is not a limit.
+     */
+    nextSendAt: timestamp('next_send_at', { withTimezone: true }),
+    batchSentCount: integer('batch_sent_count').notNull().default(0),
+
     // Running totals, maintained as targets resolve.
     totalTargets: integer('total_targets').notNull().default(0),
     sentCount: integer('sent_count').notNull().default(0),
@@ -96,6 +110,16 @@ export const campaignTargets = pgTable(
 
     /** Set while a worker holds the row, so a crashed claim can be reaped. */
     claimedAt: timestamp('claimed_at', { withTimezone: true }),
+    /**
+     * Set immediately before the message is handed to WhatsApp.
+     *
+     * This is what separates "we never tried" from "we tried and do not know
+     * what happened". A worker killed between the socket write and the
+     * database write leaves a row with this set and no message id — the
+     * message may well have been delivered. Retrying it would send someone a
+     * second copy, so the reaper refuses to, and says so.
+     */
+    dispatchStartedAt: timestamp('dispatch_started_at', { withTimezone: true }),
     sentAt: timestamp('sent_at', { withTimezone: true }),
     /** WhatsApp's own message id, used to correlate delivery receipts. */
     waMessageId: text('wa_message_id'),

@@ -221,6 +221,16 @@ function stringify(value: unknown): string {
   return String(value);
 }
 
-/** Upper bound on one upload, to keep a single request from exhausting memory. */
-export const MAX_IMPORT_ROWS = 20_000;
-export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+/**
+ * Upper bounds on one upload.
+ *
+ * Defaults only — the real values come from the environment, because the
+ * right number depends entirely on how much memory the container has. Parsing
+ * is not streamed, so these are memory limits wearing file-size labels.
+ *
+ * Callers should prefer `loadEnv().MAX_IMPORT_ROWS` and `MAX_UPLOAD_MB`.
+ * These remain for code that has no environment to read, such as the pure
+ * mapping helpers above.
+ */
+export const MAX_IMPORT_ROWS = 5_000;
+export const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
