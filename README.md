@@ -4,13 +4,9 @@ Upload a spreadsheet, link WhatsApp from your phone with an 8-character code,
 and let a server send personalised messages at a human pace. No laptop left
 running, no second device to scan a QR with, no per-message fees.
 
-The whole thing is designed to run on hosting that costs nothing: a single
-Oracle Cloud "Always Free" ARM instance, Postgres in a container next to it.
+For the initial no-card deployment, one Render Free Docker service runs the website and worker, with Supabase Free Postgres. Follow the complete [deployment guide](docs/DEPLOYMENT.md), including external five-minute monitoring and provider limits.
 
-> **Status — end to end, not yet battle-tested.** Linking, importing,
-> templates, campaigns, sending and search all work, and 83 behaviours are
-> verified against a real Postgres on every commit. What has *not* happened is
-> a message reaching a real phone: see [What is actually proven](#what-is-actually-proven).
+> **Status: locally tested deployment candidate.** Read the [verification record](docs/VERIFICATION.md) for passing checks and outstanding Linux-container, provider OAuth and capacity tests. Free hosting does not guarantee uninterrupted service.
 
 The original single-file terminal script still lives at [`index.js`](index.js)
 and still works — see [Legacy script](#legacy-script).
