@@ -93,3 +93,15 @@ jobs:
       # the ledgers that back them.
       - name: Verify send pipeline
         run: npm run verify:pipeline --workspace=@wa/worker
+
+      - name: Verify restart and ownership
+        run: npm run verify:restart --workspace=@wa/worker
+
+      - name: Verify upload budgets
+        run: node --import tsx apps/web/src/testing/verify-upload.ts
+
+      - name: Verify Linux process supervision
+        run: node infra/testing/verify-launch.mjs
+
+      - name: Build and boot combined Render image
+        run: bash infra/testing/render-smoke.sh

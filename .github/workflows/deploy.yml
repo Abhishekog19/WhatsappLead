@@ -18,8 +18,9 @@ jobs:
   deploy:
     # `workflow_run` fires on failure too, so the conclusion has to be checked.
     if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      vars.ENABLE_ORACLE_DEPLOY == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
 
     # Point this at a GitHub Environment to require a manual approval and to
