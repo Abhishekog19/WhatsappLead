@@ -8,8 +8,9 @@
     "build": "next build",
     "start": "next start -p 3000",
     "typecheck": "tsc --noEmit",
-    "verify": "tsx src/testing/verify-settings.ts",
-    "verify:build": "next build"
+    "verify": "tsx src/testing/verify-settings.ts && tsx src/testing/verify-auth.ts",
+    "verify:build": "node ../../infra/verify-build.mjs",
+    "verify:auth": "tsx src/testing/verify-auth.ts"
   },
   "dependencies": {
     "@auth/drizzle-adapter": "^1.7.4",

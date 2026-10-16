@@ -9,8 +9,12 @@ node_modules
 **/.next
 .next-verify
 **/.next-verify
+**/.next-verify-*
 dist
 **/dist
+# Verification output and the throwaway databases the suites create.
+.verify
+**/.verify
 
 # Secrets. .env.example is intentionally NOT ignored.
 .env
@@ -34,3 +38,10 @@ templates.json
 .idea
 **/*.log
 README.md
+**/src/testing
+**/*.tsbuildinfo
+**/*.csv
+**/*.xlsm
+**/*.xls
+**/.env
+**/.env.*

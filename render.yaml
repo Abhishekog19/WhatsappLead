@@ -1,0 +1,83 @@
+# One free Docker web service: website and WhatsApp worker in one container.
+#
+# Exactly one service for this deployment; the worker cannot
+# be serverless — it holds a WhatsApp socket open for hours. infra/launch.mjs
+# supervises both halves inside the container and fails the whole service if
+# either dies, so it cannot answer health checks while the sender is dead.
+#
+# Secrets are NOT here. Every one is marked `sync: false`, which tells Render
+# to expect a value set in the dashboard and never to read one from this file.
+# A committed render.yaml is a public file in a public repository.
+#
+# Migrations are not run by this deployment. The free tier has no pre-deploy
+# command and no shell, so `npm run db:migrate` runs from a developer's
+# machine against Supabase BEFORE the deploy. See docs/DEPLOYMENT.md.
+
+services:
+  - type: web
+    name: whatsapp-outreach
+    runtime: docker
+    plan: free
+    # A free service runs a single instance, which is also what correctness
+    # requires here: two instances would both try to hold the same WhatsApp
+    # sessions. The lease in wa_session_leases is what makes the overlap
+    # during a deploy safe, not an excuse to scale out.
+    numInstances: 1
+    dockerfilePath: ./infra/Dockerfile.render
+    dockerContext: .
+
+    # Gate deployment on database isolation and this container worker.
+    # External cron-job.org monitoring uses /api/ping instead.
+    healthCheckPath: /api/health
+
+    envVars:
+      # --- Set these in the Render dashboard -----------------------------
+      # Supabase, as the restricted wa_app role through the shared pooler.
+      # Direct connections are IPv6-only on Supabase's free plan.
+      - key: DATABASE_URL
+        sync: false
+      # Signs session cookies. 32 random bytes, base64.
+      - key: AUTH_SECRET
+        sync: false
+      # Encrypts WhatsApp credentials at rest. Losing it means every linked
+      # number must be paired again. 32 random bytes, base64.
+      - key: CREDS_ENCRYPTION_KEY
+        sync: false
+      - key: AUTH_GOOGLE_ID
+        sync: false
+      - key: AUTH_GOOGLE_SECRET
+        sync: false
+      # The public https://<name>.onrender.com address. Auth.js builds its
+      # OAuth callback from this, and Google rejects a mismatch.
+      - key: APP_URL
+        sync: false
+      - key: AUTH_URL
+        sync: false
+
+      # --- Resource budget: 512 MB and 0.1 CPU, shared ------------------
+      # Both processes draw on the same memory and the same pooler. These are
+      # deliberately small; raise them only with somewhere larger to run.
+      - key: WEB_DB_POOL
+        value: "3"
+      - key: WORKER_DB_POOL
+        value: "3"
+      - key: MAX_UPLOAD_MB
+        value: "4"
+      - key: MAX_IMPORT_ROWS
+        value: "5000"
+      - key: MAX_CONCURRENT_IMPORTS
+        value: "1"
+
+      # The worker's health endpoint, internal to the container. Must differ
+      # from the public PORT Render injects, and must avoid the ports Render
+      # reserves (18012, 18013, 19099).
+      - key: WORKER_HEALTH_PORT
+        value: "3001"
+
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      # Baileys is extremely chatty at debug level and logs message contents.
+      - key: WA_ENGINE
+        value: baileys
