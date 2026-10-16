@@ -1,4 +1,4 @@
-import { checkTenantIsolation, sql } from '@wa/db';
+import { checkTenantIsolation, releaseAllLeases, renewOwnedSession, sql } from '@wa/db';
 import { createContext } from './context';
 import { startHealthServer } from './health';
 import { Scheduler } from './scheduler';
@@ -42,6 +42,10 @@ async function main(): Promise<void> {
   // Fail fast on a bad DATABASE_URL rather than letting every job log the same
   // connection error once a minute.
   await ctx.db.execute(sql`select 1`);
+  // Fail startup on a partially migrated deployment, before opening sockets.
+  await ctx.db.execute(sql`select next_send_at, batch_sent_count from campaigns limit 0`);
+  await ctx.db.execute(sql`select dispatch_started_at from campaign_targets limit 0`);
+  await ctx.db.execute(sql`select session_id from wa_session_leases limit 0`);
   ctx.log.info('database reachable');
 
   // Refuse to run if tenant isolation is not actually enforced. A superuser
@@ -86,6 +90,27 @@ async function main(): Promise<void> {
 
   scheduler.start();
 
+  // Renew independently of the serial scheduler: a slow send must not starve
+  // session ownership. Fail closed on DB loss or an expired lease.
+  let renewing = false;
+  const leaseTimer = setInterval(async () => {
+    if (renewing) return;
+    renewing = true;
+    try {
+      for (const id of Object.keys(ctx.wa.statuses())) {
+        let timer: NodeJS.Timeout | undefined;
+        const held = await Promise.race([
+          renewOwnedSession(ctx.db, id, ctx.workerId),
+          new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 10_000); }),
+        ]).catch(() => false).finally(() => { if (timer) clearTimeout(timer); });
+        if (!held) await ctx.wa.drop(id);
+      }
+    } catch {
+      ctx.log.error('session ownership guard failed; restarting worker');
+      process.exit(1);
+    } finally { renewing = false; }
+  }, 20_000);
+
   let shuttingDown = false;
   const shutdown = async (signal: string) => {
     if (shuttingDown) {
@@ -93,6 +118,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     shuttingDown = true;
+    clearInterval(leaseTimer);
     ctx.log.info('shutting down', { signal });
 
     // Stop answering health checks first so the orchestrator routes elsewhere
@@ -102,6 +128,17 @@ async function main(): Promise<void> {
     // Before the pool closes: each socket flushes its encrypted auth state,
     // and that write needs a connection.
     await ctx.wa.closeAll();
+
+    // Hand the session leases back explicitly. They would lapse on their own
+    // within 90 seconds, but a deployment starts the replacement immediately —
+    // releasing here is the difference between the new instance picking the
+    // sessions up at once and every account sitting idle while the old lease
+    // times out.
+    const released = await releaseAllLeases(ctx.db, ctx.workerId).catch((err) => {
+      ctx.log.warn('could not release session leases on shutdown', { error: err });
+      return 0;
+    });
+    if (released > 0) ctx.log.info('released session leases', { count: released });
     await ctx.sql.end({ timeout: 5 });
 
     ctx.log.info('shutdown complete');

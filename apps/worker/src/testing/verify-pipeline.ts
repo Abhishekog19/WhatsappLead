@@ -130,9 +130,9 @@ async function main(): Promise<void> {
 
     // The real spreadsheet's shape, through the real mapping code.
     const rawRows = [
-      { Name: 'Ishwar Dental Clinic', Phone: '+91 72018 64189', Category: 'Dental clinic', Rating: '4.9', Reviews: '33', Signals: 'No Website', Website: '-' },
-      { Name: 'Sankalp Skin Care', Phone: '+91 79845 48806', Category: 'Skin care clinic', Rating: '5', Reviews: '72', Signals: 'No Website', Website: '-' },
-      { Name: 'Vadodara Physio', Phone: '+91 98250 11111', Category: 'Physical therapy clinic', Rating: '4.5', Reviews: '12', Signals: 'No Website; Few Reviews', Website: '-' },
+      { Name: 'Synthetic Dental A', Phone: '+91 90000 00011', Category: 'Dental clinic', Rating: '4.9', Reviews: '33', Signals: 'No Website', Website: '-' },
+      { Name: 'Synthetic Skin B', Phone: '+91 90000 00012', Category: 'Skin care clinic', Rating: '5', Reviews: '72', Signals: 'No Website', Website: '-' },
+      { Name: 'Synthetic Physio C', Phone: '+91 98250 11111', Category: 'Physical therapy clinic', Rating: '4.5', Reviews: '12', Signals: 'No Website; Few Reviews', Website: '-' },
       { Name: 'Already Messaged Clinic', Phone: '+91 98250 22222', Category: 'Dentist', Rating: '4.2', Reviews: '8', Signals: 'No Website', Website: '-' },
       { Name: 'Opted Out Clinic', Phone: '+91 98250 33333', Category: 'Doctor', Rating: '4.0', Reviews: '5', Signals: 'No Website', Website: '-' },
       { Name: 'Landline Only', Phone: '+91 98250 44444', Category: 'Hospital', Rating: '3.9', Reviews: '2', Signals: 'No Website', Website: '-' },
@@ -148,7 +148,7 @@ async function main(): Promise<void> {
         .insert(schema.contactLists)
         .values({
           userId,
-          name: 'Vadodara clinics',
+          name: 'Synthetic clinics',
           columns: mapped.columns,
           rowsTotal: mapped.totalRows,
           rowsImported: mapped.rows.length,
@@ -337,7 +337,7 @@ async function main(): Promise<void> {
     // -----------------------------------------------------------------------
     section('What was actually sent');
 
-    const first = sent.find((s) => s.phoneE164 === '+917201864189');
+    const first = sent.find((s) => s.phoneE164 === '+919000000011');
     check('placeholders were substituted', Boolean(first && !first.text.includes('{{')), first?.text);
     check(
       'spintax was expanded to one option',
@@ -354,7 +354,7 @@ async function main(): Promise<void> {
     );
     check(
       'and the contact name did too',
-      Boolean(first?.text.includes('Ishwar Dental Clinic')),
+      Boolean(first?.text.includes('Synthetic Dental A')),
       first?.text,
     );
     if (first) console.log(`       "${first.text}"`);
@@ -580,6 +580,35 @@ async function main(): Promise<void> {
     );
 
     // -----------------------------------------------------------------------
+    section('Uncertain socket outcome');
+    const uncertain = await asSystem(db, async (tx) => {
+      const [contact] = await tx.insert(schema.contacts).values({
+        userId, listId, phoneE164: '+919000000099', name: 'Synthetic uncertain recipient', onWhatsapp: 'yes',
+      }).returning();
+      const [campaign] = await tx.insert(schema.campaigns).values({
+        userId, listId, sessionId, templateId, name: 'Synthetic failure', status: 'running',
+        totalTargets: 1, nextSendAt: new Date(Date.now() - 1000),
+      }).returning();
+      const [target] = await tx.insert(schema.campaignTargets).values({
+        userId, campaignId: campaign!.id, contactId: contact!.id,
+      }).returning();
+      return { campaign: campaign!, target: target! };
+    });
+    let dispatches = 0;
+    const uncertainContext = { ...ctx, wa: stubManager({ sent: [], connected: true,
+      failWith: () => { dispatches++; return new Error('Synthetic connection lost after acceptance'); },
+    }) } as unknown as WorkerContext;
+    await sendCampaigns.run(uncertainContext, controller.signal);
+    await sendCampaigns.run(uncertainContext, controller.signal);
+    const [failedTarget] = await asSystem(db, tx => tx.select().from(schema.campaignTargets)
+      .where(eq(schema.campaignTargets.id, uncertain.target.id)));
+    const [failedCampaign] = await asSystem(db, tx => tx.select().from(schema.campaigns)
+      .where(eq(schema.campaigns.id, uncertain.campaign.id)));
+    check('uncertain send is attempted only once', dispatches === 1);
+    check('uncertain send keeps its dispatch marker and fails closed', failedTarget?.status === 'failed' && !!failedTarget.dispatchStartedAt);
+    check('uncertain send pauses the campaign for review', failedCampaign?.status === 'paused');
+    check('pacing was committed before the failed socket write', !!failedCampaign?.nextSendAt && failedCampaign.batchSentCount === 1);
+
     section('Opt-out wording');
 
     const cases: [string, boolean][] = [
