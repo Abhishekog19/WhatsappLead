@@ -1,338 +1,187 @@
-# Deploying
+# Free initial deployment: Render + Supabase
 
-Two things have to run: a **web app**, which is ordinary Next.js, and a
-**worker**, which holds a WhatsApp WebSocket open for hours at a time. That
-second requirement decides everything below.
+This deploys exactly one Render Free Docker web service with both Next.js and the WhatsApp worker. Supabase Free stores contacts, sessions, encrypted WhatsApp credentials, campaign progress and pacing. Use the included HTTPS onrender.com URL; no purchased domain, persistent disk or paid worker is needed.
 
-Both options here are free. Read [Why the worker needs a real
-server](#why-the-worker-needs-a-real-server) before picking one, because the
-obvious choice is the wrong one.
+**Release gate:** read [VERIFICATION.md](VERIFICATION.md). The Linux image and actual Google OAuth round trip must pass before inviting users. No measured linked-account capacity is established yet.
 
----
+## 1. Understand the limits
 
-## Why the worker needs a real server
+Render Free currently provides 512 MB RAM and 0.1 CPU, shared by both processes. It spins down after 15 minutes without inbound traffic. A cron-job.org request every five minutes should prevent inactivity spin-down while requests succeed; it cannot prevent restarts, monitor failures, quota suspension or maintenance. There is no internal self-pinging.
 
-WhatsApp Web is a persistent socket. A linked device stays connected, receives
-pushes, and is dropped if it goes quiet. The worker also paces itself
-deliberately — 25–55 seconds between messages, 45–90 minutes between batches —
-so a single campaign is hours of mostly-waiting with the connection live
-throughout.
+There are 750 free instance-hours per workspace/month (one 31-day month uses 744). Other services and deployment overlap use headroom. Bandwidth and build minutes have separate allowances. Render may suspend services with unusually high outbound traffic, including external database/API traffic; its documented remedy can require a paid plan. This setup cannot guarantee always-on service within a strict zero-cost constraint.
 
-Serverless hosting cannot do that. Vercel terminates a function at **300
-seconds on the Hobby plan** and there is no persistent process to hold a socket
-between invocations. This is not a configuration problem; it is what serverless
-means. The same applies to Netlify Functions, Cloudflare Workers and Lambda.
+Use only Free plans. Email/account verification is required; providers may impose additional anti-abuse checks. If signup demands a payment card, stop: this deployment cannot override that requirement. Do not enable paid add-ons. Supabase Free has a 500 MB database allowance and can pause inactive projects. Check dashboards for current quotas.
 
-So the worker needs a machine that stays on. Once you have one of those, it can
-host the web app too — which is why Option A is the recommendation even though
-Option B is the fashionable answer.
+Sources checked October 16, 2026: [Render free limits](https://render.com/docs/free), [compute plans](https://render.com/docs/compute-plans), [Supabase pricing](https://supabase.com/pricing), [Supabase connections](https://supabase.com/docs/guides/database/connecting-to-postgres).
 
-## Option A — one free VM, everything on it
+## 2. Prepare the repository locally
 
-**Recommended.** Oracle Cloud's Always Free tier gives an ARM instance with
-2 OCPU and 12 GB of RAM that does not sleep, does not expire after 12 months,
-and has no compute-hour allowance to exhaust. Postgres runs in a container
-beside the app, so there is no managed-database limit either.
+1. Install Node.js 22 and Git. Docker Desktop is optional locally but required to run the Linux image verification here; CI can run it instead.
+2. Keep the repository private for initial launch. Review git status before committing. Never add .env files, spreadsheets, send logs, backups or WhatsApp credentials.
+3. From the repository root run:
 
-One host, one `.env`, one command. Total cost: a domain name, if you want one.
+~~~powershell
+$env:PUPPETEER_SKIP_DOWNLOAD = '1'
+npm.cmd ci --ignore-scripts
+npm.cmd run typecheck
+npm.cmd run verify:build --workspace=@wa/web
+~~~
 
-### 1. Create the instance
+The verification build uses .next-verify and removes application secrets from its environment. The regular development output .next and legacy npm start workflow are preserved.
 
-In the Oracle Cloud console: **Compute → Instances → Create**.
+4. Commit and push reviewed source changes. Let GitHub CI finish, including the combined-container smoke test. It uses only a disposable Postgres database and fake WhatsApp sockets. Do not deploy a failing revision.
+5. The old SSH/Oracle deployment workflow is opt-in via the ENABLE_ORACLE_DEPLOY repository variable. Leave it unset for Render.
 
-- Shape: **Ampere A1 (ARM)**, 1–2 OCPU, 6–12 GB — all within Always Free
-- Image: **Ubuntu 24.04**
-- Add your SSH public key
+## 3. Create Supabase Free
 
-### 2. Point a domain at it
+1. Create a Supabase account and organization on the Free plan.
+2. Create a project in a region close to your intended Render region. Save the database owner password in a password manager.
+3. Open **Connect → Session pooler**. Copy its actual hostname and project reference. Do not guess the aws index or region in the hostname.
+4. Use session mode, port 5432. Owner and runtime formats:
 
-An A record for your domain to the instance's public IP. Caddy obtains the TLS
-certificate automatically, so the domain has to resolve before you start the
-stack.
+~~~text
+Owner (local migration commands only):
+postgresql://postgres.PROJECT_REF:ENCODED_PASSWORD@aws-INDEX-REGION.pooler.supabase.com:5432/postgres
 
-No domain? Skip to [Running without a domain](#running-without-a-domain).
+Restricted application (Render DATABASE_URL):
+postgresql://wa_app.PROJECT_REF:ENCODED_APP_PASSWORD@aws-INDEX-REGION.pooler.supabase.com:5432/postgres
 
-### 3. Provision the host
+Direct connection, if your network supports IPv6:
+postgresql://wa_app:ENCODED_APP_PASSWORD@db.PROJECT_REF.supabase.co:5432/postgres
+~~~
 
-```bash
-ssh ubuntu@<your-ip>
-git clone <your-repo> ~/whatsapp-lead-platform
-cd ~/whatsapp-lead-platform
-bash infra/oracle-setup.sh
-```
+Percent-encode special characters in passwords, including @, :, /, # and %. The shared pooler requires the project-qualified username. Direct connections use wa_app without the suffix. Do not use the Supabase anon or service-role API key as a database password.
 
-That installs Docker, opens 80 and 443 in both iptables and ufw, adds 4 GB of
-swap, and turns on log rotation. Log out and back in afterwards so your user
-picks up the `docker` group.
+The Postgres client disables prepared statements and uses transaction-local tenant settings. Session-pooler port 5432 is the selected deployment method. Do not switch connection methods without re-running connection verification.
 
-### 4. Open the ports in the Oracle console
+TLS certificate verification is enforced for Supabase hostnames. If the direct endpoint needs a project CA, copy its PEM certificate from Supabase into DATABASE_SSL_CA (literal newlines or escaped \n). Never disable certificate verification. Enable SSL enforcement in Supabase if available. See [SSL enforcement](https://supabase.com/docs/guides/platform/ssl-enforcement).
 
-**This is the step everyone misses.** The host firewall is not enough — Oracle
-has its own network ACL in front of it.
+## 4. Apply migrations and create the restricted role
 
-**Networking → Virtual Cloud Networks → your VCN → Security Lists → Default →
-Add Ingress Rules**, then add two: source `0.0.0.0/0`, TCP, destination port
-`80`, and the same for `443`.
+Do this on your computer, before deployment. Render Free has no shell or paid pre-deploy job available.
 
-A fresh instance that pings but refuses HTTP is almost always this.
+1. If .env does not exist, copy .env.example to .env. **Do not overwrite your existing local .env.** Save deployment-only credentials in a password manager; do not replace your local development database unless intended.
+2. For the migration commands, set MIGRATION_DATABASE_URL to the owner/session-pooler URL and POSTGRES_APP_PASSWORD to a new long random password. Use temporary environment variables or the gitignored .env. Do not put the values into screenshots, logs, Git or chat.
+3. Run:
 
-### 5. Fill in `.env`
+~~~powershell
+npm.cmd run db:migrate
+npm.cmd run db:setup-role
+~~~
 
-```bash
-cp .env.example .env
-nano .env
-```
+Migrations create the schema; setup-role enables wa_app LOGIN with NOSUPERUSER and NOBYPASSRLS and grants table access. The audit log remains append-only. The web and worker must never use the owner URL.
 
-Generate the two secrets:
+4. Set DATABASE_URL to the wa_app.PROJECT_REF session-pooler URL and run:
 
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
-```
+~~~powershell
+npm.cmd run db:verify-connection
+~~~
 
-| Variable | What it is |
+Resolve every failure. This probes role privileges, TLS information, schema, transaction-local tenant context and lease SQL. It briefly creates then deletes a synthetic probe user. It does not send messages. The pooler TLS observation from pg_stat_ssl describes its backend connection; client TLS verification is separately enforced by the driver.
+
+5. Remove MIGRATION_DATABASE_URL and POSTGRES_APP_PASSWORD from the terminal environment when finished. **Do not add either to Render.** Keep them securely for future migrations/backups.
+
+## 5. Create Google OAuth credentials
+
+1. Open Google Cloud Console and create/select a project. Google OAuth for basic identity does not need a paid hosting service.
+2. Open Google Auth Platform (or APIs & Services → OAuth consent screen). Configure the app name, support email and developer contact.
+3. Choose an external audience and keep the app in Testing initially. Add yourself and a second tester. Do not enable public access before resource testing.
+4. Create an OAuth client: **Web application**. Save the client ID and client secret.
+5. Add the local redirect URI if you still use local development: http://localhost:3000/api/auth/callback/google.
+6. After Render assigns the actual service URL, add its exact redirect URI:
+
+~~~text
+https://YOUR-ACTUAL-SERVICE.onrender.com/api/auth/callback/google
+~~~
+
+Use the actual assigned URL, which may have a suffix; a desired name is not proof of the URL. Authorized JavaScript origin, if requested: https://YOUR-ACTUAL-SERVICE.onrender.com. No trailing path on the origin.
+
+Only basic profile/email scopes are used. Follow any consent-screen or verification prompts Google actually displays; do not assume every account is exempt. See [Google web OAuth](https://developers.google.com/identity/protocols/oauth2/web-server).
+
+## 6. Create the single Render Free service
+
+1. Sign up to Render, verify your account, connect the GitHub repository.
+2. Choose **New → Web Service**, the reviewed branch, runtime **Docker**.
+3. Root/build context: repository root (.). Dockerfile: **./infra/Dockerfile.render**.
+4. Choose **Free**, one instance, a region close to Supabase. Add no database, background worker, persistent disk or paid service on Render.
+5. Set health-check path to **/api/health**. cron-job.org will use the separate **/api/ping** endpoint.
+6. Disable automatic deployments initially. Deploy manually only after CI and migrations pass. Alternatively use the included render.yaml Blueprint, which declares exactly one Free service.
+7. Add dashboard-managed environment variables:
+
+| Variable | Value |
 |---|---|
-| `DOMAIN` | `app.example.com` — no scheme, no trailing slash |
-| `ACME_EMAIL` | Where Let's Encrypt sends expiry warnings |
-| `POSTGRES_PASSWORD` | The superuser. Owns the schema, runs migrations |
-| `POSTGRES_APP_PASSWORD` | The `wa_app` role the app connects as. **Not** the same |
-| `AUTH_SECRET` | Signs session cookies |
-| `CREDS_ENCRYPTION_KEY` | Encrypts WhatsApp credentials at rest |
-| `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` | From the next step |
+| DATABASE_URL | Restricted wa_app.PROJECT_REF session-pooler URL |
+| AUTH_SECRET | New independent random 32-byte base64 secret |
+| CREDS_ENCRYPTION_KEY | New independent random 32-byte base64 key; retain it permanently |
+| AUTH_GOOGLE_ID | Google OAuth client ID |
+| AUTH_GOOGLE_SECRET | Google OAuth client secret |
+| APP_URL and AUTH_URL | Actual https://...onrender.com address |
+| NODE_ENV | production |
+| WA_ENGINE | baileys |
+| LOG_LEVEL | info |
+| WEB_DB_POOL and WORKER_DB_POOL | 3 each |
+| WORKER_HEALTH_PORT | 3001 |
+| MAX_UPLOAD_MB | 4 |
+| MAX_IMPORT_ROWS | 5000 |
+| MAX_CONCURRENT_IMPORTS | 1 |
+| DATABASE_SSL_CA | Optional project CA PEM if required |
 
-The two Postgres passwords are not redundant. Postgres exempts superusers from
-row-level security, so an app connecting as one has every tenant-isolation
-policy silently skipped — all the queries still look right, because the app
-filters by `user_id` as well, and nothing goes wrong until one `where` clause
-is missing. The app therefore gets an unprivileged role, and both the worker
-and `/api/health` refuse to report healthy if that is ever not the case.
+Generate each secret locally with node -e "console.log(require('crypto').randomBytes(32).toString('base64'))". Store the outputs securely, never in this repository. If moving existing encrypted credentials, use their existing encryption key instead of generating a replacement.
 
-**Keep `CREDS_ENCRYPTION_KEY` somewhere you will still have in six months.**
-Losing it means every linked WhatsApp number has to be paired again.
+Render injects PORT. The launcher binds Next.js to 0.0.0.0 on that port and the worker health listener to 127.0.0.1:3001. Do not set a start command, add self-pings, or pass secrets as build arguments.
 
-### 6. Google sign-in
+8. Click Deploy. Copy the actual service URL from Render; correct APP_URL/AUTH_URL and the Google redirect URI if necessary, then redeploy.
+9. Confirm the deploy passes /api/health: status ok, db ok, isolation enforced, worker alive. /api/ping should return plain ok. Check the sign-in page has its styles and scripts.
+10. Do not ignore a failed health check. Wrong credentials, missing migrations and owner-role access are startup blockers. Consult sanitized Render logs.
 
-At [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials):
-**Create Credentials → OAuth client ID → Web application**.
+## 7. Configure external monitoring to avoid inactivity sleep
 
-- Authorised redirect URI: `https://your-domain/api/auth/callback/google`
-- Add `http://localhost:3000/api/auth/callback/google` too, for local work
+1. Create and verify a free account at [cron-job.org](https://cron-job.org).
+2. Create a cron job named WhatsApp platform ping.
+3. URL: **https://YOUR-ACTUAL-SERVICE.onrender.com/api/ping**.
+4. Method: **GET**. Schedule: **every five minutes** (all days/hours). No authentication header or request body.
+5. Enable failure/recovery notifications to your email and save/enable the job.
+6. Run its manual test; expect HTTP 200 and ok. Check execution history again after at least 20 minutes with your browser closed.
+7. If it has been disabled after repeated failures, fix the service then re-enable the job. Cold starts may exceed a monitor timeout; the request can still wake the service.
 
-Copy the client ID and secret into `.env`.
+Successful five-minute requests address Render's inactivity condition. They do not bypass provider limits or guarantee availability. Keep the monitor external: an asleep process cannot wake itself. [cron-job.org FAQ](https://cron-job.org/en/faq/).
 
-While the consent screen is in **Testing**, only accounts you list as test
-users can sign in. That is a reasonable way to start. To let anyone sign in,
-publish the app — for a tool that only reads a name and email, Google's
-verification is not required.
+## 8. Final acceptance tests before inviting users
 
-### 7. Start it
+These are operator steps after you authorize the deployment, not tests the coding agent performed against real accounts.
 
-```bash
-docker compose up -d --build
-docker compose logs -f
-```
+1. Sign in with tester A. Sign out and sign in again; the same account and settings should persist.
+2. Sign in as tester B in a separate browser profile. Import distinct small synthetic lists into A and B. Search each account for the other's unique marker; it must not appear. A copied contact/campaign URL must not reveal another tenant's data.
+3. Verify work hours, timezone, daily cap and dedupe preferences survive save and reload. The default never-repeat setting is per user.
+4. Link one test WhatsApp account using a pairing code on the same phone; separately verify QR linking if a second screen is available. Do not link the same device from the old local worker and cloud simultaneously.
+5. Restart the Render service with no active campaign. Verify credentials restore without re-pairing.
+6. Upload a small consent-based test list. Confirm column mapping, country codes, business details and contact search. The parser accepts XLSX/CSV, max 4 MB upload, 5000 rows, 40 columns, 8 MB total inflated XLSX bytes and 100000 cells. Complex workbooks should be exported as CSV. Server Actions have a 5 MB multipart request ceiling.
+7. Only when ready, explicitly authorize a small test campaign to recipients who agreed to receive it. Confirm the message text and business details in the contact history, then check dedupe by reimporting the same number. Do not describe a sent event as confirmed delivery unless a delivery receipt arrives.
+8. Pause a campaign, restart, and confirm it stays paused. A throttled account must stay held until cooldown expiry; reconnecting must not bypass it.
+9. Check Render memory and restart counts during imports and additional linked accounts. Do not invite arbitrary public traffic. No supported account count is established without this measurement.
 
-Five containers: Postgres, a one-shot migration, web, worker, Caddy. Web and
-worker wait for the migration to *succeed*, so a bad migration stops the deploy
-instead of leaving the app running against a half-built schema.
+## 9. Updates, backups and recovery
 
-First build on an ARM free tier takes a few minutes. When it settles:
+**Update:** back up first; run new migrations locally using MIGRATION_DATABASE_URL, re-run setup-role if grants changed, verify the restricted connection, wait for CI, then manually deploy that revision. Review compatibility with the still-running old container. Rollback code only if it remains compatible with the migrated schema; do not blindly reverse data migrations.
 
-```bash
-curl https://your-domain/api/health
-```
+**Backups:** Supabase recommends off-site logical backups for Free projects. Use a matching/newer PostgreSQL pg_dump client. Supply credentials through a protected password file or temporary environment variables, not an inline password in command history. Set PGHOST, PGPORT=5432, PGUSER=postgres.PROJECT_REF, PGDATABASE=postgres and verified TLS settings for your pooler, then:
 
-Expect `{"status":"ok","db":"ok","isolation":"enforced"}`. If `isolation` says
-anything else, the app is connected as the wrong role — see step 5.
+~~~powershell
+pg_dump --format=custom --no-owner --no-privileges --file=backup.dump
+~~~
 
-### 8. Deploys after the first
+Store that dump outside the repository, encrypted, separately from CREDS_ENCRYPTION_KEY. Include the drizzle schema/migration journal in a full database dump. Test restore into a separate empty project with pg_restore; run setup-role afterward because the dump omits privileges. Keep restored campaigns paused and do not attach a second worker to active credentials. Never test restore over the live database.
 
-Push to `main` and GitHub Actions does it, once you add these repository
-secrets: `SSH_HOST`, `SSH_USER`, `SSH_KEY`, and `SSH_KNOWN_HOSTS` (from
-`ssh-keyscan -H <your-ip>` — the host key is pinned rather than accepted on
-sight, so a hijacked DNS record cannot collect the deploy session). Optionally
-`SSH_PORT` and `APP_DIR`.
+**Unknown sends:** a network failure or interruption after dispatch is marked failed for review and is not automatically resent. Related contacts are withheld from other campaigns while the outcome is unknown. Review WhatsApp before deciding what to do; do not clear markers or bulk-retry blindly.
 
-Or by hand:
+**Restart:** encrypted credentials and durable next-send times live in Postgres. Overlap is coordinated by expiring DB leases, independent renewal and ownership checks before reconnect/send. Distributed leases cannot provide a transactional exactly-once guarantee for an external WhatsApp socket; ambiguous sends deliberately stop for review.
 
-```bash
-ssh ubuntu@<your-ip> 'cd ~/whatsapp-lead-platform && bash infra/deploy.sh'
-```
+**Linking stuck:** inspect worker readiness and last error first. Do not run reset-sessions against a live project without understanding which unfinished handshakes it will clear.
 
-It fast-forwards, rebuilds, prunes old images, and waits for both tiers to
-report healthy before calling the deploy a success.
+**Database unavailable/paused:** restore the Supabase project or correct its connection. Render readiness remains failed until DB and worker recover.
 
----
+**Quota suspension:** check Render usage and Supabase limits. A monitor cannot lift a suspension. Stay within the Free allowances or wait for reset where supported; there is no promise of a free remedy for every suspension.
 
-## Option B — web on Vercel, worker on a VM
+**Lost encryption key:** restore the original key from your secure backup. If unavailable, users must re-link; do not overwrite the database with a different key and expect credentials to decrypt.
 
-You asked about Vercel, so: the web half works there, and the worker does not.
-You will still need the VM from Option A, which means this buys you a CDN and a
-nicer deploy pipeline in exchange for three extra moving parts.
-
-Worth it if you already live on Vercel. Otherwise Option A is less work.
-
-### What changes
-
-| Piece | Where | Note |
-|---|---|---|
-| Web app | Vercel Hobby | Free |
-| Worker | A VM that stays on | Oracle Always Free, or GCP's always-free `e2-micro` |
-| Postgres | Managed, reachable from both | **Not Neon's free plan** — see below |
-
-### Do not use Neon's free plan for this
-
-Neon Free is **100 CU-hours per month**, about 400 hours at the smallest
-compute size, and scale-to-zero cannot be disabled. The worker queries the
-database every few seconds, so the compute never reaches its five-minute idle
-timeout and simply stays awake — roughly 730 hours a month. The allowance runs
-out in about two weeks, and then the compute is suspended until the next
-billing period.
-
-It is a fine choice for local development, where the worker is not running.
-
-**Supabase Free** fits this workload: 500 MB, shared compute, no compute-hour
-allowance, and it only pauses after a *week* of inactivity — which an
-always-connected worker never reaches. Or keep Postgres on the VM and expose it
-with TLS, which is free and unmetered but more to set up.
-
-### Steps
-
-1. **Database.** Create a Supabase project and take the connection string
-   (**Project Settings → Database → Connection string → URI**). Use the
-   connection *pooler* string for the web app if you have it; the worker should
-   use the direct one, since it holds long transactions.
-
-2. **Create the app role.** Managed providers hand you a role that bypasses
-   row-level security — Supabase's `postgres` and Neon's `neondb_owner` both
-   do. Point `DATABASE_URL` at it temporarily and run:
-
-   ```bash
-   npm run db:migrate
-   npm run db:setup-role
-   ```
-
-   `db:setup-role` needs `POSTGRES_APP_PASSWORD` in `.env`. It creates `wa_app`
-   as a non-superuser with `NOBYPASSRLS` and grants it what it needs. Then
-   change `DATABASE_URL` to use `wa_app`, keeping the host and database the
-   same.
-
-3. **Deploy the web app to Vercel.** Import the repository, then set:
-
-   - **Root Directory**: `apps/web`
-   - **Build Command**: `cd ../.. && npm run build --workspace=@wa/web`
-   - **Install Command**: `cd ../.. && npm ci --ignore-scripts --omit=optional`
-
-   The `cd ../..` matters: this is an npm workspace, and the lockfile lives at
-   the repository root. `--ignore-scripts` skips the legacy script's Chromium
-   download, which the web app has no use for.
-
-   Environment variables: `DATABASE_URL` (as `wa_app`), `AUTH_SECRET`,
-   `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET`, `CREDS_ENCRYPTION_KEY`, and
-   `APP_URL` / `AUTH_URL` set to your Vercel URL. Add the Vercel URL's
-   `/api/auth/callback/google` to the Google client.
-
-4. **Run the worker on the VM.** Provision as in Option A, then run only the
-   worker and point it at the managed database:
-
-   ```bash
-   docker compose up -d --build worker
-   ```
-
-   Remove the `postgres`, `migrate`, `web` and `caddy` services from
-   `docker-compose.yml`, or run the worker directly with
-   `npm run dev:worker` under a process supervisor. It needs the same `.env`
-   minus `DOMAIN` and `ACME_EMAIL`.
-
-### Two Vercel caveats
-
-**Live updates reconnect every four minutes.** The pairing-code and campaign
-screens stream over SSE, and Hobby kills a function at 300 seconds. The streams
-close themselves at 240 to stay inside that, and the browser reconnects
-automatically — a brief flicker on the "live" indicator, nothing lost.
-
-**Cold starts.** The first page load after a quiet spell takes a second or two
-while a function spins up. The worker is unaffected: it is a separate process
-on your own machine and keeps sending regardless of whether anyone has the site
-open.
-
----
-
-## Running without a domain
-
-Caddy needs a resolvable hostname for a certificate. For a quick trial, skip
-Caddy and publish the web container directly:
-
-```yaml
-# docker-compose.override.yml
-services:
-  web:
-    ports: ['3000:3000']
-```
-
-```bash
-docker compose up -d --build postgres migrate web worker
-```
-
-Then open `http://<your-ip>:3000` and set `APP_URL` / `AUTH_URL` to match.
-Google OAuth needs that exact origin as a redirect URI.
-
-**Over plain HTTP, session cookies travel unencrypted.** Fine for an afternoon
-of testing from one machine; do not leave it that way with real contacts in the
-database.
-
----
-
-## After it is up
-
-**Link a number** at Settings → WhatsApp numbers. Use a spare number first. You
-will type an 8-character code into WhatsApp on your phone — no QR, no second
-screen — or scan a QR if a second device is handy.
-
-**Send to five people you know** before pointing it at a real list, and read
-the transcripts on their contact pages. The WhatsApp socket is the one layer no
-test can reach, so the first real send is the first real proof.
-
-**Expect to start slow.** A newly linked number is capped at 10 new contacts on
-day one and ramps over a week. That ramp is the main thing protecting the
-number from being restricted. Tier promotion beyond the warm-up is not yet
-automatic, so volume stays at the first tier until that lands.
-
-### Checking on it
-
-```bash
-docker compose logs -f worker          # what the sender is doing
-docker compose logs -f web
-curl https://your-domain/api/health    # db + tenant isolation
-npm run db:reset-sessions              # unstick a failed link attempt
-npm run probe --workspace=@wa/wa -- +919876543210   # test linking in isolation
-```
-
-The dashboard and every campaign page say so plainly when no worker is alive —
-including the command to start one. If a campaign looks stuck, check there
-first: a stopped worker and a campaign pacing itself are indistinguishable from
-the database, which is exactly why that heartbeat exists.
-
-### Who can sign in
-
-Anyone with a Google account, once the consent screen is published. Each
-account is isolated: separate contacts, templates, campaigns and WhatsApp
-numbers, enforced by row-level security in Postgres rather than by application
-code remembering to filter. One account's sending history never constrains
-another's.
-
-There is no billing, no plan, and no per-account quota beyond the WhatsApp
-safety limits. If you open it to strangers, their numbers carry their own risk
-and your server carries the load — a free VM will manage a handful of users
-comfortably, since the whole design is deliberately slow.
-
-### Backups
-
-Nothing here backs itself up.
-
-```bash
-docker compose exec -T postgres pg_dump -U wa wa | gzip > backup-$(date +%F).sql.gz
-```
-
-Worth a cron entry. The WhatsApp credentials in that dump are encrypted with
-`CREDS_ENCRYPTION_KEY`, so a backup is useless without it — and so is the key
-without a backup. Keep them apart, keep them both.
+Local development remains npm run dev plus npm run dev:worker. The root legacy npm start is unchanged. Do not run the cloud and local worker against the same real WhatsApp credentials while testing.
