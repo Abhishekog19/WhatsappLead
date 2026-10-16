@@ -29,7 +29,7 @@ export function startHealthServer(ctx: WorkerContext, scheduler: Scheduler): Ser
     res.end('{"error":"not found"}');
   });
 
-  server.listen(ctx.env.WORKER_HEALTH_PORT, () => {
+  server.listen(ctx.env.WORKER_HEALTH_PORT, process.env.WORKER_HEALTH_HOST ?? '0.0.0.0', () => {
     ctx.log.info('health server listening', { port: ctx.env.WORKER_HEALTH_PORT });
   });
 

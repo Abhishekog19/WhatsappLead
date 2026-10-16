@@ -27,6 +27,9 @@ import type { Job } from '../scheduler';
 export const expirePairingArtifacts: Job = {
   name: 'expire-pairing-artifacts',
   everyMs: 30_000,
+  // Pairing codes only exist while someone is linking a number, which is
+  // rare. Nothing to expire means nobody is.
+  idleEveryMs: 120_000,
 
   async run(ctx) {
     return asSystem(ctx.db, async (tx) => {

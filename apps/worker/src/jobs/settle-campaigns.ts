@@ -19,6 +19,9 @@ import type { Job } from '../scheduler';
 export const settleCampaigns: Job = {
   name: 'settle-campaigns',
   everyMs: 60_000,
+  // Recomputes counters that only move when a message is sent, and the send
+  // loop is itself idle in this state.
+  idleEveryMs: 300_000,
 
   async run(ctx) {
     return asSystem(ctx.db, async (tx) => {

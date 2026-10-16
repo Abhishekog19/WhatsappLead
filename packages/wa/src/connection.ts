@@ -68,6 +68,7 @@ export interface WaConnectionOptions {
   handlers: WaHandlers;
   /** Routes Baileys' own wire logging; 'debug' is very loud. */
   logLevel?: string;
+  authorize?: () => Promise<void>;
 }
 
 export interface SendTextResult {
@@ -135,6 +136,7 @@ export class WaConnection {
    *   and a QR link does not need it.
    */
   async open(pairingPhone?: string | null): Promise<void> {
+    await this.opts.authorize?.();
     if (this.sock) throw new Error('Connection already open');
     this.closing = false;
     this.pairingPhone = pairingPhone ?? null;
@@ -159,6 +161,7 @@ export class WaConnection {
     const version = await latestVersion(this.log);
     const blog = baileysLogger(this.log, this.opts.logLevel ?? 'silent');
 
+    await this.opts.authorize?.();
     this.sock = makeWASocket({
       version,
       logger: blog,
@@ -476,6 +479,9 @@ export class WaConnection {
       }
     }
 
+    // Recheck after typing delays, immediately before the external side effect.
+    await this.opts.authorize?.();
+    if (this.closing || sock !== this.sock) throw new Error('Socket ownership ended');
     const sent = await sock.sendMessage(jid, { text });
     if (!sent?.key?.id) {
       throw new Error('WhatsApp accepted the message but returned no id');
@@ -533,8 +539,8 @@ export class WaConnection {
   /** Stops the socket without unlinking. Credentials survive for a restart. */
   async close(): Promise<void> {
     this.closing = true;
-    await this.auth?.flush();
     await this.teardown();
+    await this.auth?.flush();
   }
 
   private async teardown(): Promise<void> {
