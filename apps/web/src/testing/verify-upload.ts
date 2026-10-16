@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';
+import ExcelJS from 'exceljs';
+import { checkWorkbookBudget, checkCsvBudget } from '../server/upload-budget';
+
+const workbook = new ExcelJS.Workbook();
+const sheet = workbook.addWorksheet('Synthetic');
+sheet.addRow(['Name', 'Phone', 'Business']);
+for (let i = 0; i < 5000; i++) sheet.addRow([`Fixture ${i}`, '0000000000', 'Synthetic test']);
+const bytes = Buffer.from(await workbook.xlsx.writeBuffer());
+checkWorkbookBudget(bytes, 5000);
+assert.throws(() => checkWorkbookBudget(bytes, 100));
+assert.throws(() => checkWorkbookBudget(Buffer.from('not a zip'), 5000));
+checkCsvBudget('Name,Phone\n"A,B",000\n', 5000);
+assert.throws(() => checkCsvBudget('x,'.repeat(41), 5000));
+assert.throws(() => checkCsvBudget('x'.repeat(16_385), 5000));
+assert.throws(() => checkCsvBudget('a\n'.repeat(5003), 5000));
+const sparse = new ExcelJS.Workbook();
+sparse.addWorksheet('Sparse').getCell('A1000000').value = 'x';
+assert.throws(() => checkWorkbookBudget(Buffer.from([]), 5000));
+const sparseBytes = Buffer.from(await sparse.xlsx.writeBuffer());
+assert.throws(() => checkWorkbookBudget(sparseBytes, 5000));
+console.log('Upload budgets: normal 5000-row workbook and quoted CSV accepted; malformed, excessive rows/columns/cell length and sparse workbook rejected.');
+console.log(`Synthetic fixture process RSS: ${Math.round(process.memoryUsage().rss / 1024 / 1024)} MiB. Includes fixture generation; not deployed capacity.`);
