@@ -1,4 +1,4 @@
-import postgres from 'postgres';
+import { createDb } from '../client';
 import { loadEnvFile } from '@wa/core';
 
 /**
@@ -23,7 +23,7 @@ import { loadEnvFile } from '@wa/core';
 async function main(): Promise<void> {
   loadEnvFile();
 
-  const url = process.env.DATABASE_URL;
+  const url = process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL;
   if (!url) {
     console.error('DATABASE_URL is not set. It must point at the owner role.');
     process.exit(1);
@@ -39,7 +39,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const sql = postgres(url, { max: 1, prepare: false });
+  const { sql } = createDb({ url, maxConnections: 1 });
 
   try {
     const [who] = await sql<{ role: string; superuser: string }[]>`
@@ -70,6 +70,8 @@ async function main(): Promise<void> {
     await sql.unsafe(
       'alter default privileges in schema public grant select, insert, update, delete on tables to wa_app',
     );
+    // The broad grant above must not undo the append-only audit policy.
+    await sql.unsafe('revoke update, delete on audit_log from wa_app');
 
     const [check] = await sql<{ bypass: boolean; superuser: boolean }[]>`
       select rolbypassrls as bypass, rolsuper as superuser
@@ -93,6 +95,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('Failed to set up the app role:', err);
+  // Driver errors may include the ALTER ROLE statement and its password.
+  console.error('Failed to set up the app role. Check owner privileges and connection settings.');
   process.exit(1);
 });

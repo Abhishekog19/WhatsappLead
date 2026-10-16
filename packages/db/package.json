@@ -18,7 +18,8 @@
     "typecheck": "tsc --noEmit",
     "verify": "tsx src/testing/verify.ts",
     "setup-role": "tsx src/scripts/setup-app-role.ts",
-    "reset-sessions": "tsx src/scripts/reset-sessions.ts"
+    "reset-sessions": "tsx src/scripts/reset-sessions.ts",
+    "verify-connection": "tsx src/scripts/verify-connection.ts"
   },
   "dependencies": {
     "@auth/core": "^0.41.3",

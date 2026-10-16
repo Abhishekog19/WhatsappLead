@@ -23,6 +23,7 @@ import { dirname, join, resolve } from 'node:path';
  * running `tsx` by hand may be anywhere in the tree.
  */
 export function loadEnvFile(startDir: string = process.cwd()): string | null {
+  if (process.env.WA_SKIP_ENV_FILE === '1') return null;
   let dir = resolve(startDir);
 
   // Bounded by reaching the filesystem root, where dirname() stops changing.

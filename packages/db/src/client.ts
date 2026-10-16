@@ -28,10 +28,16 @@ export interface DbOptions {
 }
 
 export function createDb(options: DbOptions) {
+  const host = new URL(options.url).hostname;
+  const supabase = host.endsWith('.supabase.co') || host.endsWith('.pooler.supabase.com');
   const sql = postgres(options.url, {
+    // Never downgrade TLS verification for managed Postgres. A project CA
+    // can be supplied as PEM for direct connections that need it.
+    ...(supabase ? { ssl: { rejectUnauthorized: true, ...(process.env.DATABASE_SSL_CA ? { ca: process.env.DATABASE_SSL_CA.replace(/\\n/g, '\n') } : {}) } } : {}),
     max: options.maxConnections ?? 10,
     idle_timeout: options.idleTimeout ?? 20,
     connect_timeout: 10,
+    connection: { statement_timeout: 15_000, idle_in_transaction_session_timeout: 20_000 },
     // Timestamps are read back as Date objects by Drizzle's mode:'date'.
     prepare: false,
     onnotice: options.debug ? console.warn : () => {},
