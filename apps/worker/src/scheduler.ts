@@ -12,6 +12,21 @@ export interface Job {
   /** Minimum gap between the *end* of one run and the start of the next. */
   everyMs: number;
   /**
+   * Gap to use once the job has had nothing to do for a while.
+   *
+   * The platform is idle most of the time — a campaign sends one message
+   * every 25-55 seconds, with much longer pauses between batches, and does
+   * nothing at all outside the user's sending hours. Polling at the busy
+   * interval throughout means tens of thousands of queries a day asking
+   * whether anything has changed, which on a tenth of a CPU and a shared
+   * database pooler is a real cost for no answer.
+   *
+   * A job reporting no work for `IDLE_AFTER` consecutive runs drops to this
+   * interval, and snaps straight back the moment it finds something. Omit it
+   * for jobs whose latency matters regardless.
+   */
+  idleEveryMs?: number;
+  /**
    * Returns a short summary for the log line, or nothing when there was no
    * work to do. Receives a signal that aborts on shutdown so long passes can
    * bail out early.
@@ -24,6 +39,8 @@ type JobState = {
   nextRunAt: number;
   runs: number;
   failures: number;
+  /** Consecutive runs that reported nothing. Resets on any work. */
+  idleRuns: number;
   lastError?: string;
   lastRunAt?: number;
   lastDurationMs?: number;
@@ -56,6 +73,14 @@ export interface SchedulerStatus {
  * A job that throws is logged and retried on its next slot. Nothing a job does
  * can stop the loop.
  */
+/**
+ * Idle runs before a job backs off.
+ *
+ * Several rather than one, so a single quiet pass between two bursts of work
+ * does not halve the responsiveness of the next one.
+ */
+const IDLE_AFTER = 5;
+
 export class Scheduler {
   private readonly states: JobState[];
   private readonly abort = new AbortController();
@@ -70,7 +95,13 @@ export class Scheduler {
     jobs: Job[],
   ) {
     const now = Date.now();
-    this.states = jobs.map((job) => ({ job, nextRunAt: now, runs: 0, failures: 0 }));
+    this.states = jobs.map((job) => ({
+      job,
+      nextRunAt: now,
+      runs: 0,
+      failures: 0,
+      idleRuns: 0,
+    }));
   }
 
   start(): void {
@@ -146,17 +177,32 @@ export class Scheduler {
       // silent, so that the log is a record of activity and not of time.
       if (summary && Object.keys(summary).length > 0) {
         log.info('job did work', { ...summary, durationMs: Date.now() - started });
+        // Work found: go back to the busy interval immediately. Waking up
+        // slowly after something starts happening is the failure mode a
+        // backoff has to avoid.
+        state.idleRuns = 0;
+      } else {
+        state.idleRuns += 1;
       }
     } catch (error) {
       state.failures += 1;
       state.lastError = error instanceof Error ? error.message : String(error);
       log.error('job failed', { error, durationMs: Date.now() - started });
+      // A failure is not idleness. Backing off because the database is
+      // refusing connections would slow recovery exactly when it matters.
+      state.idleRuns = 0;
     } finally {
       state.lastRunAt = started;
       state.lastDurationMs = Date.now() - started;
       // Schedule from completion, not from the slot, so a slow job cannot
       // build up a backlog it then tries to run back-to-back.
-      state.nextRunAt = Date.now() + state.job.everyMs;
+      // Back off once a job has been idle for a while, so a quiet platform
+      // stops asking the database the same question every few seconds.
+      const interval =
+        state.job.idleEveryMs !== undefined && state.idleRuns >= IDLE_AFTER
+          ? state.job.idleEveryMs
+          : state.job.everyMs;
+      state.nextRunAt = Date.now() + interval;
     }
   }
 

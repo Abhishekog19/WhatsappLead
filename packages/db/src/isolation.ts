@@ -48,19 +48,17 @@ export async function checkTenantIsolation(db: Database): Promise<IsolationStatu
   const bypassRls = row?.bypass_rls === true;
 
   const unprotected = await db.execute<{ relname: string }>(sql`
-    select c.relname
-      from pg_class c
-      join pg_namespace n on n.oid = c.relnamespace
-     where n.nspname = 'public'
-       and c.relkind = 'r'
-       and c.relname in (
+    select expected.name as relname
+      from unnest(array[
          'settings', 'wa_sessions', 'contact_lists', 'contacts', 'suppressions',
          'templates', 'template_variants', 'campaigns', 'campaign_targets',
          'new_contact_sends', 'throttle_events', 'message_events', 'audit_log',
          'users'
-       )
-       and not (c.relrowsecurity and c.relforcerowsecurity)
-     order by c.relname
+       ]) as expected(name)
+      left join pg_class c on c.relname = expected.name
+        and c.relnamespace = 'public'::regnamespace and c.relkind = 'r'
+     where c.oid is null or not (c.relrowsecurity and c.relforcerowsecurity)
+     order by expected.name
   `);
 
   const unprotectedTables = unprotected.map((r) => r.relname);

@@ -1,5 +1,12 @@
 import { and, eq, isNull, lte, sql } from 'drizzle-orm';
-import { asSystem, schema } from '@wa/db';
+import {
+  acquireSessionLease,
+  asSystem,
+  pruneExpiredLeases,
+  releaseSessionLease,
+  renewOwnedSession,
+  schema,
+} from '@wa/db';
 import type { Job } from '../scheduler';
 import type { WorkerContext } from '../context';
 
@@ -47,9 +54,20 @@ const lastAttemptAt = new Map<string, number>();
 export const maintainSessions: Job = {
   name: 'maintain-sessions',
   everyMs: 5_000,
+  // Every session connected and nothing waiting to link. A new link request
+  // waits up to 20 seconds for its code, which is noticeable but acceptable;
+  // dropping below that costs a query every few seconds, all day, to learn
+  // nothing. Any change at all snaps it back to 5 seconds.
+  idleEveryMs: 20_000,
 
   async run(ctx) {
-    const summary = { linked: 0, resumed: 0, released: 0, dropped: 0 };
+    const summary = {
+      linked: 0,
+      resumed: 0,
+      released: 0,
+      dropped: 0,
+      leaseHeldElsewhere: 0,
+    };
 
     // --- 1. Throttle holds that have expired ------------------------------
     // Back to 'disconnected' rather than 'connected': the hold is over, but
@@ -102,10 +120,36 @@ export const maintainSessions: Job = {
       // A live socket is left strictly alone, whatever the row says. This is
       // the check that keeps a handshake in progress from being restarted
       // under the user while they are typing a code.
-      if (ctx.wa.has(session.id)) continue;
+      //
+      // The lease still has to be renewed, though, and losing it is the one
+      // reason to let go of a working socket: another worker has taken the
+      // session, and two connections to the same linked device get the number
+      // logged out.
+      if (ctx.wa.has(session.id)) {
+        const held = await renewOwnedSession(ctx.db, session.id, ctx.workerId).catch(() => false);
+        if (!held) {
+          ctx.log.warn('lost session lease, closing socket', {
+            sessionId: session.id,
+          });
+          await ctx.wa.drop(session.id);
+          summary.dropped += 1;
+        }
+        continue;
+      }
 
       const since = Date.now() - (lastAttemptAt.get(session.id) ?? 0);
       if (since < RETRY_COOLDOWN_MS) continue;
+
+      // Nothing opens a socket without the lease. During a deployment overlap
+      // the outgoing instance still holds it, and the incoming one simply
+      // waits — quietly, because this is the expected state for a few seconds
+      // on every deploy rather than a fault.
+      const lease = await acquireSessionLease(ctx.db, session.id, ctx.workerId);
+      if (!lease.held) {
+        summary.leaseHeldElsewhere += 1;
+        continue;
+      }
+
       lastAttemptAt.set(session.id, Date.now());
 
       // Linked already: reconnect with the stored credentials.
@@ -172,9 +216,18 @@ export const maintainSessions: Job = {
     for (const sessionId of Object.keys(ctx.wa.statuses())) {
       if (wantedIds.has(sessionId)) continue;
       await ctx.wa.drop(sessionId);
+      // Handing the lease back immediately, rather than waiting for it to
+      // lapse, lets another worker pick the session up without a 90-second
+      // gap in which nobody owns it.
+      await releaseSessionLease(ctx.db, sessionId, ctx.workerId).catch((err) =>
+        ctx.log.warn('could not release lease', { sessionId, error: err }),
+      );
       lastAttemptAt.delete(sessionId);
       summary.dropped += 1;
     }
+
+    // Cheap, and keeps the lease table readable when something is wrong.
+    await pruneExpiredLeases(ctx.db).catch(() => undefined);
 
     // Forget cooldowns for sessions that no longer exist, so this cannot grow
     // without bound in a long-lived process.

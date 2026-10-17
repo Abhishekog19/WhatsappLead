@@ -1,4 +1,4 @@
-import postgres from 'postgres';
+import { createDb } from '../client';
 import { loadEnvFile } from '@wa/core';
 
 /**
@@ -23,7 +23,7 @@ import { loadEnvFile } from '@wa/core';
 async function main(): Promise<void> {
   loadEnvFile();
 
-  const url = process.env.DATABASE_URL;
+  const url = process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL;
   if (!url) {
     console.error('DATABASE_URL is not set. It must point at the owner role.');
     process.exit(1);
@@ -39,7 +39,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const sql = postgres(url, { max: 1, prepare: false });
+  const { sql } = createDb({ url, maxConnections: 1 });
 
   try {
     const [who] = await sql<{ role: string; superuser: string }[]>`
@@ -50,16 +50,63 @@ async function main(): Promise<void> {
     // Idempotent: safe to re-run after a password rotation or a failed
     // attempt. The attributes are set unconditionally so an existing role
     // created by hand without them is corrected rather than left wrong.
-    await sql.unsafe(`
-      do $$
-      begin
-        if not exists (select 1 from pg_roles where rolname = 'wa_app') then
-          create role wa_app login nosuperuser nobypassrls nocreatedb nocreaterole;
-        end if;
-      end
-      $$;
-    `);
-    await sql`alter role wa_app with login nosuperuser nobypassrls password ${sql.unsafe(`'${password.replace(/'/g, "''")}'`)}`;
+    //
+    // On Supabase the `postgres` user is not a true superuser and cannot
+    // ALTER ROLE on a role it doesn't own. We try two approaches:
+    //   1. CREATE with password inline (works when role doesn't exist yet).
+    //   2. ALTER ROLE (works on self-hosted / local Postgres).
+    //   3. SECURITY DEFINER helper function (Supabase fallback).
+    // If all three fail we still verify NOSUPERUSER/NOBYPASSRLS and let the
+    // operator set the password manually via the Supabase SQL editor.
+    const escaped = password.replace(/'/g, "''");
+    const roleExists = await sql<{ exists: boolean }[]>`
+      select exists(select 1 from pg_roles where rolname = 'wa_app') as exists
+    `;
+    if (!roleExists[0]?.exists) {
+      // Role does not exist — create it with the password in one statement
+      // so we never need ALTER ROLE at all.
+      await sql.unsafe(
+        `create role wa_app with login nosuperuser nobypassrls nocreatedb nocreaterole password '${escaped}'`,
+      );
+    } else {
+      // Role already exists — try ALTER ROLE, then SECURITY DEFINER fallback.
+      let passwordSet = false;
+      try {
+        await sql.unsafe(
+          `alter role wa_app with login nosuperuser nobypassrls password '${escaped}'`,
+        );
+        passwordSet = true;
+      } catch (alterErr: unknown) {
+        const msg = alterErr instanceof Error ? alterErr.message : String(alterErr);
+        if (!msg.includes('permission denied')) throw alterErr;
+        // Supabase: postgres user cannot ALTER ROLE on roles it doesn't own.
+        // Try a SECURITY DEFINER function that executes as the role creator.
+        try {
+          await sql.unsafe(`
+            create or replace function _wa_set_app_password()
+            returns void language plpgsql security definer as $$
+            begin
+              execute format('alter role wa_app with login nosuperuser nobypassrls password %L', '${escaped}');
+            end $$;
+          `);
+          await sql.unsafe(`select _wa_set_app_password()`);
+          await sql.unsafe(`drop function if exists _wa_set_app_password()`);
+          passwordSet = true;
+        } catch {
+          // Security definer also failed — the operator must set the password
+          // manually. We still enforce the other attributes below.
+          console.warn(
+            '\nWarning: could not set wa_app password automatically (Supabase restriction).',
+            '\nRun this in the Supabase SQL editor (Dashboard → SQL Editor):',
+            `\n  ALTER ROLE wa_app WITH LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '${password}';`,
+            '\nThen re-run db:verify-connection.\n',
+          );
+        }
+      }
+      if (passwordSet) {
+        console.log('wa_app password set.');
+      }
+    }
 
     // Grants, in case migration 0001 ran before the role existed. Repeating
     // them is harmless and makes the order the two were run in irrelevant.
@@ -70,6 +117,8 @@ async function main(): Promise<void> {
     await sql.unsafe(
       'alter default privileges in schema public grant select, insert, update, delete on tables to wa_app',
     );
+    // The broad grant above must not undo the append-only audit policy.
+    await sql.unsafe('revoke update, delete on audit_log from wa_app');
 
     const [check] = await sql<{ bypass: boolean; superuser: boolean }[]>`
       select rolbypassrls as bypass, rolsuper as superuser
@@ -93,6 +142,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('Failed to set up the app role:', err);
+  // Driver errors may include the ALTER ROLE statement and its password.
+  console.error('Failed to set up the app role. Check owner privileges and connection settings.');
   process.exit(1);
 });

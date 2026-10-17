@@ -60,7 +60,7 @@ async function main(): Promise<void> {
        where table_schema = 'public' and table_type = 'BASE TABLE'
     `);
     // drizzle's own bookkeeping table lives in the `drizzle` schema, not here.
-    check('19 tables created', Number(tables[0]?.n) === 19, tables[0]);
+    check('20 tables created', Number(tables[0]?.n) === 20, tables[0]);
 
     // worker_heartbeats is deliberately NOT a tenant table: it is
     // infrastructure, holds no personal data, and every account depends on the
@@ -85,6 +85,48 @@ async function main(): Promise<void> {
       'worker_heartbeats carries no tenant column and no RLS, by design',
       heartbeatTable[0]?.rls === false && heartbeatTable[0]?.has_user_id === false,
       heartbeatTable[0],
+    );
+
+    // wa_session_leases is infrastructure for the same reason: it records
+    // which process holds a socket, not whose data it is. Asserted so that
+    // stays a decision rather than becoming an oversight.
+    const leaseTable = await owner.db.execute<{
+      rls: boolean;
+      has_user_id: boolean;
+    }>(sql`
+      select c.relrowsecurity as rls,
+             exists (
+               select 1 from information_schema.columns
+                where table_schema = 'public'
+                  and table_name = 'wa_session_leases'
+                  and column_name = 'user_id'
+             ) as has_user_id
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = 'public' and c.relname = 'wa_session_leases'
+    `);
+    check(
+      'wa_session_leases is infrastructure too',
+      leaseTable[0]?.rls === false && leaseTable[0]?.has_user_id === false,
+      leaseTable[0],
+    );
+
+    // The grant is explicit in 0004 rather than inherited from the default
+    // privileges set in 0001, because those only apply to tables created
+    // afterwards by the same role — and a managed provider may not run every
+    // migration as the schema owner. Getting that wrong shows up as a worker
+    // that can claim nothing, which is a bad way to find out.
+    const leaseGrants = await app.db.execute<{ n: number }>(sql`
+      select count(*)::int as n
+        from information_schema.role_table_grants
+       where grantee = current_user
+         and table_name in ('wa_session_leases', 'worker_heartbeats')
+         and privilege_type in ('SELECT', 'INSERT', 'UPDATE', 'DELETE')
+    `);
+    check(
+      'and the application role can actually use both',
+      Number(leaseGrants[0]?.n) === 8,
+      leaseGrants[0],
     );
 
     const forced = await owner.db.execute<{ relname: string }>(sql`

@@ -43,10 +43,22 @@ import type { WorkerContext } from '../context';
  * without re-messaging anyone.
  */
 
+/**
+ * The in-memory half of the pacer.
+ *
+ * The parts that MUST survive a restart — when the next message may go out,
+ * and how far into the current batch we are — live on the campaign row. This
+ * holds only what is safe to lose: the jittered batch target, which is
+ * re-rolled anyway, and log throttling.
+ *
+ * That split matters more here than it sounds. A free instance spins down
+ * after fifteen idle minutes and may be recycled at any time, so restarts are
+ * routine rather than exceptional. With the whole pacer in memory, every
+ * restart reset it: the inter-message delay was skipped, and so was the
+ * 45-90 minute pause between batches. Pacing exists to look human, and a
+ * limit a restart bypasses is not a limit.
+ */
 interface PacerState {
-  /** Epoch ms; the campaign may not send before this. */
-  nextSendAt: number;
-  sentInBatch: number;
   /** Jittered, so the rhythm is not "exactly 15, pause, exactly 15". */
   batchTarget: number;
   /** Suppresses repeated "budget exhausted" logging. */
@@ -57,11 +69,14 @@ const pacers = new Map<string, PacerState>();
 
 /** Skipped targets cost no WhatsApp traffic, so a tick may clear several. */
 const MAX_SKIPS_PER_TICK = 50;
-const MAX_ATTEMPTS = 3;
 
 export const sendCampaigns: Job = {
   name: 'send-campaigns',
   everyMs: 3_000,
+  // Nothing is running: a campaign only becomes due when someone starts one,
+  // and 20 seconds of extra latency before its first message is invisible
+  // next to the 25-55 second gap between every message after it.
+  idleEveryMs: 20_000,
 
   async run(ctx, signal) {
     const due = await loadRunnableCampaigns(ctx);
@@ -95,6 +110,9 @@ interface RunnableCampaign {
   sessionId: string;
   templateId: string;
   dailyCapOverride: number | null;
+  /** Durable pacing: see the note on PacerState. */
+  nextSendAt: Date | null;
+  batchSentCount: number;
   // Session
   accountType: AccountType;
   tier: number;
@@ -128,6 +146,8 @@ async function loadRunnableCampaigns(ctx: WorkerContext): Promise<RunnableCampai
         sessionId: schema.campaigns.sessionId,
         templateId: schema.campaigns.templateId,
         dailyCapOverride: schema.campaigns.dailyCapOverride,
+        nextSendAt: schema.campaigns.nextSendAt,
+        batchSentCount: schema.campaigns.batchSentCount,
 
         accountType: schema.waSessions.accountType,
         tier: schema.waSessions.tier,
@@ -173,25 +193,41 @@ async function runOneCampaign(
   signal: AbortSignal,
 ): Promise<TickResult> {
   const result: TickResult = { sent: 0, skipped: 0, failed: 0, held: 0 };
+  // An overlapping deployment without this session must not overwrite its
+  // durable pacer while the owning worker is sending.
+  if (!ctx.wa.get(campaign.sessionId)?.isConnected) return result;
   const now = Date.now();
 
   const pacer = pacers.get(campaign.campaignId) ?? seedPacer(campaign);
   pacers.set(campaign.campaignId, pacer);
 
-  if (now < pacer.nextSendAt) return result;
+  // The due time comes off the row, so a restart cannot skip the wait. A
+  // campaign that has never sent has no next_send_at; start it promptly, with
+  // a little jitter so a restart does not fire every campaign at once.
+  if (campaign.nextSendAt === null) {
+    await holdUntil(
+      ctx,
+      campaign.campaignId,
+      new Date(now + Math.floor(Math.random() * 10_000)),
+    );
+    return result;
+  }
+  if (now < campaign.nextSendAt.getTime()) return result;
 
   // --- Gates. Each is a reason to do nothing, not a reason to fail. --------
 
   const conn = ctx.wa.get(campaign.sessionId);
   if (!conn?.isConnected || campaign.sessionStatus !== 'connected') {
     // maintain-sessions owns reconnecting. Re-check in a few seconds.
-    pacer.nextSendAt = now + 10_000;
+    await holdUntil(ctx, campaign.campaignId, new Date(now + 10_000));
     result.held += 1;
     return result;
   }
 
   if (campaign.throttledUntil && campaign.throttledUntil.getTime() > now) {
-    pacer.nextSendAt = campaign.throttledUntil.getTime();
+    // Held until the throttle expires, and no further. Reconnecting or
+    // retrying into a cap is what turns a temporary hold into a ban.
+    await holdUntil(ctx, campaign.campaignId, campaign.throttledUntil);
     result.held += 1;
     return result;
   }
@@ -205,14 +241,14 @@ async function runOneCampaign(
   if (!isWithinSendWindow(new Date(now), window)) {
     // Checking every 5 minutes is precise enough for an hour-granularity
     // window and avoids recomputing timezone maths every tick.
-    pacer.nextSendAt = now + 5 * 60_000;
+    await holdUntil(ctx, campaign.campaignId, new Date(now + 5 * 60_000));
     result.held += 1;
     return result;
   }
 
   const budget = await remainingBudget(ctx, campaign);
   if (budget <= 0) {
-    pacer.nextSendAt = now + 10 * 60_000;
+    await holdUntil(ctx, campaign.campaignId, new Date(now + 10 * 60_000));
     if (now > pacer.quietUntil) {
       ctx.log.info('daily cap reached, holding', {
         campaignId: campaign.campaignId,
@@ -245,11 +281,13 @@ async function runOneCampaign(
     }
 
     // A real send. Do it, then stop — one message per campaign per tick.
+    // Reserve pacing before any socket write. A crash can add a delay, but
+    // must never erase a committed cooldown.
+    await advancePacer(ctx, pacer, campaign);
     const outcome = await sendOne(ctx, campaign, claimed);
     if (outcome === 'sent') result.sent += 1;
     else result.failed += 1;
 
-    advancePacer(pacer, campaign);
     return result;
   }
 
@@ -258,26 +296,64 @@ async function runOneCampaign(
 
 function seedPacer(campaign: RunnableCampaign): PacerState {
   return {
-    // A short randomised head start, so a worker restart does not fire every
-    // campaign's first message at the same instant.
-    nextSendAt: Date.now() + Math.floor(Math.random() * 10_000),
-    sentInBatch: 0,
     batchTarget: jitterBatchSize(campaign.batchSize),
     quietUntil: 0,
   };
 }
 
-function advancePacer(pacer: PacerState, campaign: RunnableCampaign): void {
-  pacer.sentInBatch += 1;
+/** Pushes the campaign's next-send time out, durably. */
+async function holdUntil(
+  ctx: WorkerContext,
+  campaignId: string,
+  when: Date,
+): Promise<void> {
+  await asSystem(ctx.db, async (tx) => {
+    await tx
+      .update(schema.campaigns)
+      .set({ nextSendAt: when })
+      .where(eq(schema.campaigns.id, campaignId));
+  });
+}
 
-  if (pacer.sentInBatch >= pacer.batchTarget) {
-    pacer.nextSendAt = Date.now() + nextBatchPauseMs(campaign);
-    pacer.sentInBatch = 0;
+/**
+ * Records that a message just went out, and when the next one may.
+ *
+ * Written to the row rather than held in memory so a restart cannot skip the
+ * wait. One extra UPDATE per message, against a gap of 25-55 seconds.
+ */
+async function advancePacer(
+  ctx: WorkerContext,
+  pacer: PacerState,
+  campaign: RunnableCampaign,
+): Promise<void> {
+  const sentInBatch = campaign.batchSentCount + 1;
+
+  if (sentInBatch >= pacer.batchTarget) {
+    const pause = nextBatchPauseMs(campaign);
     pacer.batchTarget = jitterBatchSize(campaign.batchSize);
+    await asSystem(ctx.db, async (tx) => {
+      await tx
+        .update(schema.campaigns)
+        .set({ nextSendAt: new Date(Date.now() + pause), batchSentCount: 0 })
+        .where(eq(schema.campaigns.id, campaign.campaignId));
+    });
+    ctx.log.info('batch complete, pausing', {
+      campaignId: campaign.campaignId,
+      pauseMinutes: Math.round(pause / 60_000),
+    });
     return;
   }
 
-  pacer.nextSendAt = Date.now() + nextDelayMs(campaign, campaign.delayMultiplier);
+  const delay = nextDelayMs(campaign, campaign.delayMultiplier);
+  await asSystem(ctx.db, async (tx) => {
+    await tx
+      .update(schema.campaigns)
+      .set({
+        nextSendAt: new Date(Date.now() + delay),
+        batchSentCount: sentInBatch,
+      })
+      .where(eq(schema.campaigns.id, campaign.campaignId));
+  });
 }
 
 /**
@@ -425,6 +501,15 @@ async function evaluateSkip(
   });
   if (suppressed) return 'suppressed';
 
+  const unknown = await asSystem(ctx.db, async (tx) => tx.execute(sql`
+    select 1 from campaign_targets
+    where user_id = ${campaign.userId} and contact_id = ${target.contactId}
+      and dispatch_started_at is not null and sent_at is null
+      and status in ('failed', 'sending') and id <> ${target.targetId}
+    limit 1
+  `));
+  if (unknown.length) return 'suppressed';
+
   // Dedupe is per account and entirely the user's choice. One user's history
   // never constrains another's: every table consulted here is scoped by
   // user_id, and row-level security enforces that independently.
@@ -519,6 +604,24 @@ async function sendOne(
   }
 
   // --- Send ---------------------------------------------------------------
+  //
+  // The intent is committed BEFORE the socket write, and that ordering is the
+  // whole point. A worker killed between handing the message to WhatsApp and
+  // writing the result leaves a row that looks untouched — so the reaper used
+  // to put it back in the queue and someone received the message twice.
+  //
+  // With this marker the three cases are distinguishable: no marker means it
+  // never left, a marker with a message id means it went, and a marker
+  // without one means nobody knows. The third is not retried.
+  //
+  // One extra UPDATE against a 25-55 second gap between messages.
+  await asSystem(ctx.db, async (tx) => {
+    await tx
+      .update(schema.campaignTargets)
+      .set({ dispatchStartedAt: new Date(), renderedBody: rendered.text, variantId: variant.id })
+      .where(eq(schema.campaignTargets.id, target.targetId));
+  });
+
   try {
     const typingMs = campaign.simulateTyping ? typingDurationMs(rendered.text) : 0;
     const sent = await conn.sendText(target.phoneE164, rendered.text, { typingMs });
@@ -598,17 +701,16 @@ async function sendOne(
         campaignId: campaign.campaignId,
         signal: throttle,
       });
-      await releaseTarget(ctx, target, `WhatsApp signalled ${throttle}`);
+      await failTarget(ctx, target, `Delivery unknown; review before retrying. WhatsApp signalled ${throttle}`);
       await recordSendThrottle(ctx, campaign, throttle, err);
       return 'failed';
     }
 
-    const message = err instanceof Error ? err.message : String(err);
-    if (target.attempts + 1 >= MAX_ATTEMPTS) {
-      await failTarget(ctx, target, message);
-    } else {
-      await releaseTarget(ctx, target, message);
-    }
+    // A timeout or a failed ledger transaction does not prove non-delivery.
+    // Keep the dispatch marker and never automatically retry this recipient.
+    const message = 'Delivery unknown after dispatch; review WhatsApp before retrying.';
+    await failTarget(ctx, target, message);
+    await pauseCampaign(ctx, campaign.campaignId, message);
     ctx.log.warn('send failed', {
       campaignId: campaign.campaignId,
       to: maskPhone(target.phoneE164),
@@ -619,7 +721,7 @@ async function sendOne(
   }
 }
 
-/** Back to the queue for another attempt. */
+/** Safe retry only before dispatch begins (for example, no connected socket). */
 async function releaseTarget(
   ctx: WorkerContext,
   target: ClaimedTarget,
@@ -633,6 +735,7 @@ async function releaseTarget(
         attempts: sql`${schema.campaignTargets.attempts} + 1`,
         lastError: error.slice(0, 500),
         claimedAt: null,
+        dispatchStartedAt: null,
       })
       .where(eq(schema.campaignTargets.id, target.targetId));
   });

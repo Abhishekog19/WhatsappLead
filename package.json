@@ -22,7 +22,8 @@
     "db:push": "npm run push --workspace=@wa/db",
     "db:studio": "npm run studio --workspace=@wa/db",
     "db:setup-role": "npm run setup-role --workspace=@wa/db",
-    "db:reset-sessions": "npm run reset-sessions --workspace=@wa/db"
+    "db:reset-sessions": "npm run reset-sessions --workspace=@wa/db",
+    "db:verify-connection": "npm run verify-connection --workspace=@wa/db"
   },
   "dependencies": {
     "qrcode": "^1.5.4"

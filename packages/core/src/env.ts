@@ -40,6 +40,43 @@ const schema = z.object({
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 
   WORKER_TICK_MS: z.coerce.number().int().positive().default(5_000),
+
+  // --- Resource budget ----------------------------------------------------
+  //
+  // The whole platform — website, worker and every WhatsApp socket — shares
+  // one 512 MB container with a tenth of a CPU. These exist so that budget is
+  // explicit and adjustable from the dashboard, rather than hidden in the code
+  // as numbers chosen for a machine with 24 times the memory.
+  //
+  // They are also what the connection limits of a shared database pooler care
+  // about: pool size is per process, and there are two processes.
+
+  /** Postgres connections the website may hold. Short request-scoped queries. */
+  WEB_DB_POOL: z.coerce.number().int().min(1).max(20).default(3),
+  /** Postgres connections the worker may hold. Few, but longer-lived. */
+  WORKER_DB_POOL: z.coerce.number().int().min(1).max(20).default(3),
+
+  /**
+   * Largest spreadsheet accepted, in megabytes.
+   *
+   * Parsing is not streamed — the workbook is held in memory — so this is a
+   * memory limit wearing a file-size label. 4 MB of XLSX expands to roughly
+   * ten times that once parsed, which is survivable in a 512 MB container
+   * shared with everything else; 10 MB was not.
+   */
+  MAX_UPLOAD_MB: z.coerce.number().int().min(1).max(25).default(4),
+
+  /** Rows accepted from one spreadsheet, whatever the file size says. */
+  MAX_IMPORT_ROWS: z.coerce.number().int().min(100).max(50_000).default(5_000),
+
+  /**
+   * Spreadsheets parsed at once, across all users.
+   *
+   * One at a time by default. Two concurrent imports on this container is the
+   * most likely way to exhaust its memory, and an import that waits a few
+   * seconds is better than an instance the host kills for going over.
+   */
+  MAX_CONCURRENT_IMPORTS: z.coerce.number().int().min(1).max(4).default(1),
   /** Port the worker's own /health endpoint listens on, for the container probe. */
   WORKER_HEALTH_PORT: z.coerce.number().int().positive().max(65_535).default(3_001),
   WA_ENGINE: z.enum(['baileys', 'wwebjs']).default('baileys'),

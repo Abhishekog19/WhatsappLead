@@ -29,6 +29,13 @@
       "when": 1791944278281,
       "tag": "0003_worker_heartbeats",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1792063121874,
+      "tag": "0004_restart_correctness",
+      "breakpoints": true
     }
   ]
 }

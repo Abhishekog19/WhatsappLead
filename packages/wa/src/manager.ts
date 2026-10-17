@@ -22,6 +22,7 @@ export class WaManager {
     private readonly encryptionKey: string,
     private readonly log: Logger,
     private readonly logLevel: string = 'silent',
+    private readonly authorize?: (sessionId: string) => Promise<void>,
   ) {}
 
   get size(): number {
@@ -145,6 +146,7 @@ export class WaManager {
       encryptionKey: this.encryptionKey,
       log,
       logLevel: this.logLevel,
+        authorize: this.authorize ? () => this.authorize!(sessionId) : undefined,
       handlers: {
         onStatus: (status, detail) => this.persistStatus(sessionId, status, detail),
 

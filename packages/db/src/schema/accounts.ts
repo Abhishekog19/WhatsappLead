@@ -132,3 +132,34 @@ export const waSessions = pgTable(
       .where(sql`phone_e164 is not null and deleted_at is null`),
   ],
 );
+
+/**
+ * Which worker currently owns a WhatsApp session.
+ *
+ * WhatsApp allows one connection per linked device. Two workers holding the
+ * same session fight over it, and WhatsApp resolves that by logging the number
+ * out — which costs the user a re-pair. Overlapping deployments make this
+ * likely rather than theoretical: the replacement starts before the old
+ * instance has finished shutting down.
+ *
+ * A lease rather than an advisory lock, deliberately. `pg_advisory_lock` is
+ * session-scoped, and a connection pooler in transaction mode hands a
+ * different backend to each transaction, so the lock would be taken and
+ * released somewhere unrelated to the worker's lifetime. The transaction-
+ * scoped variant releases at commit, which is useless for ownership held
+ * across hours. A row with an expiry needs no session state at all and works
+ * through any pooler.
+ *
+ * Infrastructure, not tenant data: no user_id and no row-level security, like
+ * worker_heartbeats. The sessions it points at are protected; which process
+ * holds one is an operational detail every account's sending depends on.
+ */
+export const waSessionLeases = pgTable('wa_session_leases', {
+  sessionId: uuid('session_id')
+    .primaryKey()
+    .references(() => waSessions.id, { onDelete: 'cascade' }),
+  workerId: text('worker_id').notNull(),
+  acquiredAt: timestamp('acquired_at', { withTimezone: true }).defaultNow().notNull(),
+  /** Past this, another worker may take over. Renewed while the socket lives. */
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+});

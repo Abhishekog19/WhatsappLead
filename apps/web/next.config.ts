@@ -14,6 +14,7 @@ loadEnvFile();
 
 const config: NextConfig = {
   reactStrictMode: true,
+  experimental: { serverActions: { bodySizeLimit: '5mb' } },
 
   /**
    * Where the build output goes, overridable so a verification build cannot

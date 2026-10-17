@@ -9,17 +9,18 @@
     "start": "node --import tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "verify:pipeline": "tsx src/testing/verify-pipeline.ts",
-    "verify:linking": "tsx src/testing/verify-linking.ts"
+    "verify:linking": "tsx src/testing/verify-linking.ts",
+    "verify:restart": "tsx src/testing/verify-restart.ts"
   },
   "dependencies": {
     "@wa/core": "*",
     "@wa/db": "*",
     "@wa/wa": "*",
-    "drizzle-orm": "^0.38.3"
+    "drizzle-orm": "^0.38.3",
+    "tsx": "^4.19.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
-    "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
 }
