@@ -74,7 +74,8 @@ RUN npm run build --workspace=@wa/web
 
 # ---------- runtime -----------------------------------------------------------
 FROM base AS runtime
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    NODE_EXTRA_CA_CERTS=/app/infra/supabase-ca.crt
 
 # Production dependencies, and the worker's TypeScript sources, which it runs
 # directly through tsx.
@@ -82,7 +83,7 @@ COPY --from=deps --chown=node:node /app/node_modules ./node_modules
 COPY --chown=node:node package.json tsconfig.base.json ./
 COPY --chown=node:node packages ./packages
 COPY --chown=node:node apps/worker ./apps/worker
-COPY --chown=node:node infra/launch.mjs ./infra/launch.mjs
+COPY --chown=node:node infra/launch.mjs infra/supabase-ca.crt ./infra/
 
 # Next's standalone output: a self-contained server plus the minimum tree it
 # needs. `static` and `public` are not included in it and must be copied
