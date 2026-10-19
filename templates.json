@@ -1,13 +1,40 @@
 {
-  "default": "Hi {{name}}, I help businesses like {{business}} get a professional website that brings in more customers. Would you be open to a quick chat this week?",
+  "_note": "Each key maps to an ARRAY of message variants (1–N strings). The script picks one variant at random per lead. Add more strings to any array to increase variation. Use {{name}} and {{business}} as placeholders — they are filled in automatically.",
 
-  "no_website": "Hi {{name}}, I noticed {{business}} doesn't have a website yet — that's costing you customers who search online before visiting. I build affordable, fast websites for local businesses. Want me to send a quick sample?",
+  "default": [
+    "Hi {{name}}, I help businesses like {{business}} get a professional website that brings in more customers. Would you be open to a quick chat this week?",
+    "Hi {{name}}, just reaching out — I build websites for local businesses and thought {{business}} might benefit from a stronger online presence. Happy to share some examples if you're curious.",
+    "Hey {{name}}, I work with small businesses to set up websites that actually bring in leads. Would love to show you what I've done for businesses similar to {{business}}."
+  ],
 
-  "outdated_website": "Hi {{name}}, I checked out {{business}}'s website and had a few ideas to modernize it and get you more inquiries. I offer redesigns starting at a fixed price — want me to share a quick before/after mockup?",
+  "no_website": [
+    "Hi {{name}}, I noticed {{business}} doesn't have a website yet — that's costing you customers who search online before visiting. I build affordable, fast websites for local businesses. Want me to send a quick sample?",
+    "Hey {{name}}, most people check online before deciding where to go — and {{business}} not having a website means you're likely missing them. I can put something together quickly and affordably. Want to see an example?",
+    "Hi {{name}}, a lot of customers for businesses like {{business}} start their search on Google. A simple website could make a real difference. I'd be happy to show you what that looks like — no pressure."
+  ],
 
-  "restaurant": "Hi {{name}}, is {{business}} currently taking online orders or bookings through your own website? I build simple, fast sites for restaurants with menu + WhatsApp ordering built in. Happy to show you an example.",
+  "outdated_website": [
+    "Hi {{name}}, I checked out {{business}}'s website and had a few ideas to modernize it and get you more inquiries. I offer redesigns starting at a fixed price — want me to share a quick before/after mockup?",
+    "Hey {{name}}, I came across {{business}}'s website and noticed it could use a refresh. A cleaner, faster site can noticeably improve how many visitors reach out. Want me to put together a quick concept?",
+    "Hi {{name}}, I specialize in redesigning websites for businesses like {{business}}. A modern look and faster load time can directly increase the number of people who contact you. Happy to share a sample if you're interested."
+  ],
 
-  "clinic": "Hi {{name}}, I help clinics like {{business}} get found on Google and let patients book appointments online. I recently helped a clinic improve their local visibility significantly. Want a quick look at what that could look like for you?",
+  "restaurant": [
+    "Hi {{name}}, is {{business}} currently taking online orders or bookings through your own website? I build simple, fast sites for restaurants with menu + WhatsApp ordering built in. Happy to show you an example.",
+    "Hey {{name}}, I help restaurants like {{business}} get their own online ordering or booking page — no commissions, fully yours. Want me to send over a quick demo of what that looks like?",
+    "Hi {{name}}, many diners look up the menu or book a table online before visiting. I build restaurant websites with menus and WhatsApp order links built in — something like that could work well for {{business}}. Interested in seeing a sample?"
+  ],
 
-  "retail": "Hi {{name}}, does {{business}} have a way for customers to browse products online? I build simple catalog/e-commerce sites for retail businesses so you're not limited to walk-ins. Want a quick example?"
+  "clinic": [
+    "Hi {{name}}, I help clinics like {{business}} get found on Google and let patients book appointments online. I recently helped a clinic improve their local visibility significantly. Want a quick look at what that could look like for you?",
+    "Hey {{name}}, patients today search online before choosing a clinic. I build websites for clinics that rank well locally and make booking easy. Could be a good fit for {{business}} — want me to share some examples?",
+    "Hi {{name}}, I work with clinics to build websites that help them show up in local searches and reduce no-shows through online booking. Happy to share what I've done for practices similar to {{business}} if you're curious."
+  ],
+
+  "retail": [
+    "Hi {{name}}, does {{business}} have a way for customers to browse products online? I build simple catalog/e-commerce sites for retail businesses so you're not limited to walk-ins. Want a quick example?",
+    "Hey {{name}}, a lot of retail sales are moving online — having a catalog or shop page for {{business}} could open up a whole new channel. I keep it simple and affordable. Want me to show you what's possible?",
+    "Hi {{name}}, I help retail businesses like {{business}} set up online product pages so customers can browse and order from home. It's simpler than it sounds and doesn't cost a fortune. Happy to send a quick demo."
+  ]
 }
+
